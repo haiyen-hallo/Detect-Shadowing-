@@ -1,6 +1,9 @@
-
-
-import os, sys, json, argparse, warnings, traceback
+import os
+import sys
+import json
+import argparse
+import warnings
+import traceback
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -8,7 +11,7 @@ import cv2
 import joblib
 from sklearn.metrics import (
     accuracy_score, f1_score, recall_score, precision_score,
-    roc_auc_score, confusion_matrix, average_precision_score,
+    confusion_matrix,
 )
 
 warnings.filterwarnings("ignore")
@@ -26,25 +29,151 @@ try:
     print("[import] ✅ Predict.py loaded thành công")
 except ImportError as e:
     print(f"[import] ❌ Không import được Predict.py: {e}")
-    print("         Đảm bảo Evaluate.py cùng thư mục với Predict.py")
     sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ★ ĐỒNG BỘ HOÀN TOÀN VỚI Train.py MỚI (13 features)
+# ═══════════════════════════════════════════════════════════════════
+
+# [SYNC] Ngưỡng tối tuyệt đối — phải khớp Train.py
+ABSOLUTE_DARK_THRESHOLD = 0.38
+
+# [SYNC] 13 features — phải khớp SELECTED_FEATURES trong Train.py
+SELECTED_FEATURES = [
+    # Positional
+    "row_ratio", "angle_axis_norm", "col_ratio",
+    # Core intensity
+    "mean", "contrast", "ray_mean_above",
+    # Continuity
+    "vert_continuity",
+    # Derived cũ
+    "depth_darkness", "is_shadow_candidate", "ray_dark_context",
+    # ★ NEW 3 features — thêm vào để khớp model mới
+    "absolute_dark",
+    "vray_dark_score",
+    "shadow_zone_score",
+]
+
+# [SYNC] 16 derived features — phải khớp DERIVED_FEATURE_NAMES trong Train.py
+DERIVED_FEATURE_NAMES = [
+    # 13 cũ
+    "above_below_ratio", "shadow_drop", "dark_bright_above",
+    "lateral_contrast_nm", "depth_darkness", "vert_dark_depth",
+    "anti_reverb_dark", "phys_shadow_score",
+    "col_dark_score", "depth_col_dark",
+    "is_shadow_candidate", "shadow_contrast",
+    "ray_dark_context",
+    # ★ 3 mới
+    "absolute_dark",
+    "vray_dark_score",
+    "shadow_zone_score",
+]
+
+
+def engineer_probe_features_predict(X: np.ndarray, feature_names: list) -> tuple:
+    """
+    [SYNC] Phải giống hệt hàm engineer_probe_features() trong Train.py.
+    Thêm 3 features mới: absolute_dark, vray_dark_score, shadow_zone_score.
+    """
+    fn  = {name: i for i, name in enumerate(feature_names)}
+    eps = 1e-6
+    def _c(name):
+        return X[:, fn[name]].astype(np.float64) if name in fn else np.zeros(len(X), np.float64)
+
+    mean      = _c("mean")
+    ray_above = _c("ray_mean_above")
+    lat_drop  = _c("lateral_drop")
+    vert_cont = _c("vert_continuity")
+    reverb    = _c("reverb_score")
+    dist_norm = _c("dist_origin_norm")
+    row_ratio = _c("row_ratio")
+
+    # Adaptive max mean (tính trên toàn panel — giống lúc predict đơn panel)
+    adaptive_max_mean = np.clip(np.median(mean) * 0.85, 0.15, 0.50) if len(mean) > 0 else 0.30
+
+    darkness    = np.clip((adaptive_max_mean - mean) / (adaptive_max_mean + eps), 0.0, 1.0)
+    above_below = np.clip(ray_above / (mean + eps), 0.0, 10.0)
+    shadow_drop = np.clip(ray_above - mean, 0.0, 1.0)
+    dark_bright = darkness * np.clip(ray_above, 0.0, 1.0)
+    lat_norm    = np.clip(lat_drop / (mean + eps), -2.0, 5.0)
+    depth_dark  = dist_norm * np.clip(1.0 - mean, 0.0, 1.0)
+    vert_depth  = vert_cont * dist_norm
+    anti_reverb = np.clip(1.0 - reverb, 0.0, 1.0) * np.clip(1.0 - mean, 0.0, 1.0)
+    phys        = np.clip(np.clip(above_below / 5.0, 0.0, 1.0) * shadow_drop * darkness, 0.0, 1.0)
+    col_dark    = darkness * np.clip(0.4 + 0.6 * row_ratio, 0.4, 1.0)
+    depth_col   = dist_norm * col_dark
+
+    # [SYNC FIX] is_shadow_candidate — thêm absolute gate (giống Train.py mới)
+    abs_gate  = np.clip((ABSOLUTE_DARK_THRESHOLD - mean) / (ABSOLUTE_DARK_THRESHOLD + eps), 0.0, 1.0)
+    is_shadow = abs_gate * darkness * np.clip((above_below - 1.0) / 2.0, 0.0, 1.0)
+
+    shadow_cont      = np.clip(above_below / 5.0, 0.0, 1.0) * np.clip(lat_drop, 0.0, 1.0)
+    ray_dark_context = np.clip(vert_cont * darkness * np.clip(ray_above, 0.0, 1.0), 0.0, 1.0)
+
+    # ★ [SYNC] 3 features mới — bắt buộc phải có để khớp model 13 features
+    absolute_dark     = np.clip((ABSOLUTE_DARK_THRESHOLD - mean) / (ABSOLUTE_DARK_THRESHOLD + eps), 0.0, 1.0)
+    bright_above_sig  = np.clip((ray_above - 0.35) / (0.35 + eps), 0.0, 1.0)
+    current_dark_sig  = np.clip((0.40 - mean) / (0.40 + eps), 0.0, 1.0)
+    vray_dark_score   = np.clip(bright_above_sig * current_dark_sig * vert_cont, 0.0, 1.0)
+    shadow_zone_score = np.clip(ray_above * vert_cont * np.clip(1.0 - mean, 0.0, 1.0), 0.0, 1.0)
+
+    new = np.column_stack([
+        above_below, shadow_drop, dark_bright, lat_norm, depth_dark, vert_depth, anti_reverb,
+        phys, col_dark, depth_col, is_shadow, shadow_cont, ray_dark_context,
+        # ★ 3 mới
+        absolute_dark, vray_dark_score, shadow_zone_score,
+    ]).astype(np.float32)
+
+    return np.hstack([X, np.nan_to_num(new, nan=0., posinf=1., neginf=-1.)]), feature_names + DERIVED_FEATURE_NAMES
+
+
+def select_features_predict(X: np.ndarray, feature_names: list, selected: list = None) -> np.ndarray:
+    if selected is None:
+        selected = SELECTED_FEATURES
+    fn_map  = {name: i for i, name in enumerate(feature_names)}
+    missing = [s for s in selected if s not in fn_map]
+    if missing:
+        raise ValueError(f"[FeatureSync] Thiếu features: {missing}. "
+                         f"Kiểm tra engineer_probe_features_predict() có đủ 16 derived features không.")
+    idx = [fn_map[s] for s in selected]
+    return X[:, idx].astype(X.dtype, copy=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WRAPPER — tự động pipeline features trước khi gọi model
+# ═══════════════════════════════════════════════════════════════════
+
+class FeatureAdaptedModelWrapper:
+    """
+    Bọc model để tự động:
+      raw features (18) → engineer (18+16=34) → select (13) → model.predict_proba
+    Đảm bảo khớp 100% với pipeline Train.py.
+    """
+    def __init__(self, raw_model, raw_feature_names):
+        self.model             = raw_model
+        self.raw_feature_names = list(raw_feature_names)
+
+    def predict_proba(self, X):
+        if np.isnan(X).sum() + np.isinf(X).sum() > 0:
+            X = np.nan_to_num(X, nan=0., posinf=1., neginf=-1.)
+
+        X_eng, full_names = engineer_probe_features_predict(X, list(self.raw_feature_names))
+        X_sel = select_features_predict(X_eng, full_names, SELECTED_FEATURES)
+        return self.model.predict_proba(X_sel)
 
 
 # ═══════════════════════════════════════════════════════════════════
 # FILE UTILS
 # ═══════════════════════════════════════════════════════════════════
 
-IMG_EXTS = [".jpg", ".jpeg", ".png", ".bmp",
-            ".JPG", ".JPEG", ".PNG", ".BMP"]
-
+IMG_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".JPG", ".JPEG", ".PNG", ".BMP"]
 
 def find_file(folder: str, stem: str):
-    """Tìm file theo stem trong folder, thử tất cả extension ảnh."""
     for ext in IMG_EXTS:
         path = os.path.join(folder, stem + ext)
         if os.path.exists(path):
             return path
-    # Tìm kiếm không phân biệt hoa thường
     try:
         for fname in os.listdir(folder):
             if Path(fname).stem.lower() == stem.lower():
@@ -55,10 +184,6 @@ def find_file(folder: str, stem: str):
 
 
 def load_mask_binary(mask_path: str, H: int, W: int) -> np.ndarray:
-    """
-    Load mask bác sĩ → binary ndarray (H, W) uint8 {0, 1}.
-    Resize về (H, W) nếu cần.
-    """
     img = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
     if img.shape != (H, W):
         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -66,29 +191,24 @@ def load_mask_binary(mask_path: str, H: int, W: int) -> np.ndarray:
 
 
 def pred_grid_to_pixel(pred_grid: np.ndarray, H: int, W: int) -> np.ndarray:
-    """Chuyển pred_final (n_rows x n_cols) → pixel mask (H x W)."""
     n_rows, n_cols = pred_grid.shape
     pixel = np.zeros((H, W), dtype=np.uint8)
     for r in range(n_rows):
         for c in range(n_cols):
             if pred_grid[r, c] > 0:
-                y0 = r * PATCH_H;  y1 = min(y0 + PATCH_H, H)
-                x0 = c * PATCH_W;  x1 = min(x0 + PATCH_W, W)
+                y0 = r * PATCH_H; y1 = min(y0 + PATCH_H, H)
+                x0 = c * PATCH_W; x1 = min(x0 + PATCH_W, W)
                 pixel[y0:y1, x0:x1] = 1
     return pixel
 
 
 def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
                          H: int, W: int, thr: float = 0.30) -> np.ndarray:
-    """
-    Chuyển pixel mask → patch grid (n_rows x n_cols).
-    Patch = 1 nếu tỉ lệ pixel shadow trong patch >= thr.
-    """
     grid = np.zeros((n_rows, n_cols), dtype=np.uint8)
     for r in range(n_rows):
         for c in range(n_cols):
-            y0 = r * PATCH_H;  y1 = min(y0 + PATCH_H, H)
-            x0 = c * PATCH_W;  x1 = min(x0 + PATCH_W, W)
+            y0 = r * PATCH_H; y1 = min(y0 + PATCH_H, H)
+            x0 = c * PATCH_W; x1 = min(x0 + PATCH_W, W)
             patch = mask[y0:y1, x0:x1]
             if patch.size > 0 and float(patch.mean()) >= thr:
                 grid[r, c] = 1
@@ -96,92 +216,56 @@ def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# OVERLAY VISUALIZATION
+# VISUALIZATION
 # ═══════════════════════════════════════════════════════════════════
 
-def make_overlay_image(gray: np.ndarray,
-                       gt_mask: np.ndarray,
-                       pred_mask: np.ndarray,
-                       iou: float,
-                       stem: str) -> np.ndarray:
-    """
-    Tạo ảnh overlay với 3 lớp màu:
-      XANH (Blue)    = bác sĩ khoanh  (GT only)
-      ĐỎ   (Red)     = model detect   (Pred only)
-      TÍM  (Magenta) = trùng nhau     (GT ∩ Pred)
-
-    Layout: [ảnh gốc | ảnh overlay | legend]
-    """
-    H, W  = gray.shape
-    base  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
+    H, W   = gray.shape
+    base   = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     canvas = base.copy()
+    ALPHA  = 0.55
 
-    gt_only   = (gt_mask   == 1) & (pred_mask == 0)
-    pred_only = (pred_mask == 1) & (gt_mask   == 0)
-    both      = (gt_mask   == 1) & (pred_mask == 1)
+    gt_only   = (gt_mask == 1)   & (pred_mask == 0)
+    pred_only = (pred_mask == 1) & (gt_mask == 0)
+    both      = (gt_mask == 1)   & (pred_mask == 1)
 
-    ALPHA = 0.55
+    for region, color in [(gt_only, (255, 50, 50)), (pred_only, (30, 30, 220)), (both, (180, 30, 180))]:
+        layer = np.zeros_like(canvas)
+        layer[region] = color
+        canvas = cv2.addWeighted(canvas, 1.0, layer, ALPHA, 0)
 
-    # XANH dương = bác sĩ
-    layer = np.zeros_like(canvas)
-    layer[gt_only] = (255, 50, 50)         # BGR
-    canvas = cv2.addWeighted(canvas, 1.0, layer, ALPHA, 0)
+    for mask_u8, color in [((gt_mask * 255).astype(np.uint8),   (255, 80, 80)),
+                            ((pred_mask * 255).astype(np.uint8), (60, 60, 255))]:
+        cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(canvas, cnts, -1, color, 2)
 
-    # ĐỎ = model
-    layer = np.zeros_like(canvas)
-    layer[pred_only] = (30, 30, 220)       # BGR
-    canvas = cv2.addWeighted(canvas, 1.0, layer, ALPHA, 0)
-
-    # TÍM/MAGENTA = overlap
-    layer = np.zeros_like(canvas)
-    layer[both] = (180, 30, 180)           # BGR
-    canvas = cv2.addWeighted(canvas, 1.0, layer, ALPHA, 0)
-
-    # Contour bác sĩ — xanh dương đậm
-    gt_u8 = (gt_mask * 255).astype(np.uint8)
-    cnts, _ = cv2.findContours(gt_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(canvas, cnts, -1, (255, 80, 80), 2)
-
-    # Contour model — đỏ đậm
-    pr_u8 = (pred_mask * 255).astype(np.uint8)
-    cnts, _ = cv2.findContours(pr_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(canvas, cnts, -1, (60, 60, 255), 2)
-
-    # ── Legend ─────────────────────────────────────────────────────
-    LEG_W = 210
+    LEG_W  = 210
     legend = np.full((H, LEG_W, 3), 25, dtype=np.uint8)
 
     def txt(img, s, y, col, sc=0.40, th=1):
-        cv2.putText(img, s, (8, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    sc, col, th, cv2.LINE_AA)
-
+        cv2.putText(img, s, (8, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col, th, cv2.LINE_AA)
     def box(img, col, y):
         cv2.rectangle(img, (8, y - 11), (22, y + 2), col, -1)
-        cv2.rectangle(img, (8, y - 11), (22, y + 2), (120,120,120), 1)
 
-    gt_px   = int(gt_mask.sum())
-    pr_px   = int(pred_mask.sum())
-    bo_px   = int(both.sum())
-    un_px   = int(((gt_mask == 1) | (pred_mask == 1)).sum())
-    dice    = 2 * bo_px / max(gt_px + pr_px, 1)
-    sens_m  = bo_px / max(gt_px, 1)
-    prec_m  = bo_px / max(pr_px, 1)
+    gt_px  = int(gt_mask.sum());   pr_px = int(pred_mask.sum())
+    bo_px  = int(both.sum());      un_px = int(((gt_mask == 1) | (pred_mask == 1)).sum())
+    dice   = 2 * bo_px / max(gt_px + pr_px, 1)
+    sens_m = bo_px / max(gt_px, 1); prec_m = bo_px / max(pr_px, 1)
 
-    txt(legend, stem[:22],         18, (220, 220, 220), 0.36)
-    txt(legend, f"IoU  : {iou*100:.1f}%",   36, (180, 255, 180), 0.42)
-    txt(legend, f"Dice : {dice*100:.1f}%",  54, (180, 255, 180), 0.42)
+    txt(legend, stem[:22],               18,  (220, 220, 220), 0.36)
+    txt(legend, f"IoU  : {iou*100:.1f}%", 36,  (180, 255, 180), 0.42)
+    txt(legend, f"Dice : {dice*100:.1f}%", 54, (180, 255, 180), 0.42)
     txt(legend, f"Sens : {sens_m*100:.1f}%", 72, (180, 255, 180), 0.42)
     txt(legend, f"Prec : {prec_m*100:.1f}%", 90, (180, 255, 180), 0.42)
-
-    box(legend, (255, 80,  80),  118); txt(legend, f"Bac si : {gt_px:,}px",  120, (200,180,255))
-    box(legend, (60,  60, 255),  138); txt(legend, f"Model  : {pr_px:,}px",  140, (180,200,255))
-    box(legend, (180, 30, 180),  158); txt(legend, f"Trung  : {bo_px:,}px",  160, (255,180,255))
+    box(legend, (255, 80, 80),  118); txt(legend, f"Bac si : {gt_px:,}px",  120, (200,180,255))
+    box(legend, (60, 60, 255),  138); txt(legend, f"Model  : {pr_px:,}px",  140, (180,200,255))
+    box(legend, (180, 30, 180), 158); txt(legend, f"Trung  : {bo_px:,}px",  160, (255,180,255))
     txt(legend, f"Union  : {un_px:,}px", 178, (160, 160, 160))
 
     if H > 220:
-        txt(legend, "XANH = Bac si",    H - 56, (255, 120, 120), 0.38)
-        txt(legend, "DO   = Model",      H - 40, (120, 120, 255), 0.38)
-        txt(legend, "TIM  = Trung nhau", H - 24, (255, 120, 255), 0.38)
+        txt(legend, "DO/XANH = Bac si",   H - 56, (255, 120, 120), 0.38)
+        txt(legend, "XANH DUONG = Model", H - 40, (120, 120, 255), 0.38)
+        txt(legend, "TIM  = Trung nhau",  H - 24, (255, 120, 255), 0.38)
 
     sep = np.full((H, 4, 3), 60, dtype=np.uint8)
     return np.hstack([base, sep, canvas, sep, legend])
@@ -191,76 +275,51 @@ def make_overlay_image(gray: np.ndarray,
 # METRICS
 # ═══════════════════════════════════════════════════════════════════
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                    y_score: np.ndarray = None) -> dict:
+def compute_metrics(y_true, y_pred):
     acc  = float(accuracy_score(y_true, y_pred))
     f1   = float(f1_score(y_true, y_pred, zero_division=0))
     rec  = float(recall_score(y_true, y_pred, zero_division=0))
     prec = float(precision_score(y_true, y_pred, zero_division=0))
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    cm   = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-    spec = tn / max(tn + fp, 1)
-
+    spec  = tn / max(tn + fp, 1)
     inter = int(((y_pred == 1) & (y_true == 1)).sum())
     union = int(((y_pred == 1) | (y_true == 1)).sum())
     iou   = inter / max(union, 1)
     dice  = 2 * inter / max(int(y_pred.sum()) + int(y_true.sum()), 1)
-
-    auc = ap = None
-    if y_score is not None and len(np.unique(y_true)) == 2:
-        try:
-            auc = float(roc_auc_score(y_true, y_score))
-            ap  = float(average_precision_score(y_true, y_score))
-        except Exception:
-            pass
-
     return {
-        "accuracy"   : round(acc,  4),
-        "precision"  : round(prec, 4),
-        "recall"     : round(rec,  4),
-        "f1"         : round(f1,   4),
-        "specificity": round(spec, 4),
-        "iou"        : round(iou,  4),
-        "dice"       : round(dice, 4),
-        "auc"        : round(auc,  4) if auc is not None else None,
-        "avg_prec"   : round(ap,   4) if ap  is not None else None,
+        "accuracy": round(acc, 4), "precision": round(prec, 4),
+        "recall":   round(rec, 4), "f1":        round(f1,   4),
+        "specificity": round(spec, 4), "iou": round(iou, 4), "dice": round(dice, 4),
         "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
         "n_pos": int(y_true.sum()), "n_neg": int((y_true == 0).sum()),
     }
 
 
-def compute_overlap(gt: np.ndarray, pred: np.ndarray) -> dict:
-    """Tính overlap metrics giữa 2 pixel mask."""
+def compute_overlap(gt, pred):
     inter   = int(((gt == 1) & (pred == 1)).sum())
     union   = int(((gt == 1) | (pred == 1)).sum())
-    gt_sz   = int(gt.sum())
-    pr_sz   = int(pred.sum())
+    gt_sz   = int(gt.sum()); pr_sz = int(pred.sum())
     iou     = inter / max(union, 1)
     dice    = 2 * inter / max(gt_sz + pr_sz, 1)
-    overlap = inter / max(min(gt_sz, pr_sz), 1)   # Overlap coefficient
-    sens    = inter / max(gt_sz, 1)                # recall mask-level
-    ppc     = inter / max(pr_sz, 1)               # precision mask-level
+    overlap = inter / max(min(gt_sz, pr_sz), 1)
+    sens    = inter / max(gt_sz, 1)
+    ppc     = inter / max(pr_sz, 1)
     return {
-        "iou"           : round(iou,     4),
-        "dice"          : round(dice,    4),
-        "overlap_coeff" : round(overlap, 4),
-        "sensitivity"   : round(sens,    4),
-        "precision"     : round(ppc,     4),
-        "gt_pixels"     : gt_sz,
-        "pred_pixels"   : pr_sz,
-        "inter_pixels"  : inter,
-        "union_pixels"  : union,
+        "iou": round(iou, 4), "dice": round(dice, 4),
+        "overlap_coeff": round(overlap, 4), "sensitivity": round(sens, 4),
+        "precision": round(ppc, 4), "gt_pixels": gt_sz, "pred_pixels": pr_sz,
+        "inter_pixels": inter, "union_pixels": union,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN
+# MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════════
 
 def run_evaluate(
     data_dir        : str,
-    thr_final       : float = THR_FINAL,
+    thr_final       : float = 0.55,   # [SYNC] Hạ xuống 0.55 cho model mới
     n_theta         : int   = N_THETA,
     n_r             : int   = N_R_SAMPLES,
     te_low_pct      : int   = TE_LOW_PCT,
@@ -278,7 +337,6 @@ def run_evaluate(
     split_path = os.path.join(models_dir, "test_split_images.json")
     if not os.path.exists(split_path):
         print(f"[ERROR] Không tìm thấy: {split_path}")
-        print("        Hãy chạy Train.py trước để sinh file này.")
         sys.exit(1)
 
     with open(split_path, encoding="utf-8") as f:
@@ -286,29 +344,60 @@ def run_evaluate(
     print(f"\n[eval] {len(test_stems)} ảnh test từ test_split_images.json")
 
     # ── 2. Load model ──────────────────────────────────────────────
-    model = None
+    raw_model = None
     for fname in ["stacking_model.pkl", "rf_model.pkl"]:
         p = os.path.join(models_dir, fname)
         if os.path.exists(p):
-            model = joblib.load(p)
+            raw_model = joblib.load(p)
             print(f"[eval] Model: {fname}")
             break
-    if model is None:
-        print(f"[ERROR] Không tìm thấy model trong {models_dir}")
+    if raw_model is None:
+        print(f"[ERROR] Không tìm thấy .pkl trong {models_dir}")
         sys.exit(1)
 
-    # ── 3. Tìm thư mục ảnh & mask ─────────────────────────────────
+    # ── 3. Load feature names từ dataset.npz ─────────────────────
+    # [KEY FIX] Load đặc trưng gốc từ npz (18 features từ Noise.py)
+    # KHÔNG dùng SELECTED_FEATURES ở đây — đó là đặc trưng SAU khi engineer
+    npz_candidates = [
+        os.path.join(data_dir, "dataset.npz"),
+        os.path.join(os.path.dirname(data_dir), "dataset.npz"),
+    ]
+    raw_feature_names = None
+    for npz_path in npz_candidates:
+        if os.path.exists(npz_path):
+            d = np.load(npz_path, allow_pickle=True)
+            raw_feature_names = [str(s) for s in d["feature_names"]]
+            print(f"[eval] Loaded {len(raw_feature_names)} raw features từ: {npz_path}")
+            print(f"       Features: {raw_feature_names}")
+            break
+
+    if raw_feature_names is None:
+        # Fallback: dùng tên chuẩn từ Noise.py
+        raw_feature_names = [
+            "contrast", "homogeneity", "correlation", "energy",
+            "mean", "std", "skewness", "entropy",
+            "row_ratio", "col_ratio", "local_contrast", "below_bright",
+            "dist_origin_norm", "angle_axis_norm", "ray_mean_above",
+            "lateral_drop", "vert_continuity", "reverb_score",
+        ]
+        print(f"[eval] ⚠ Không tìm thấy dataset.npz → dùng fallback 18 features từ Noise.py")
+
+    # Xác nhận model nhận đúng số features
+    expected_n = len(SELECTED_FEATURES)
+    print(f"\n[eval] Pipeline: {len(raw_feature_names)} raw → engineer → {expected_n} selected → model")
+    print(f"[eval] SELECTED_FEATURES ({expected_n}): {SELECTED_FEATURES}")
+
+    # Bọc model với wrapper tự động engineer features
+    model = FeatureAdaptedModelWrapper(raw_model, raw_feature_names)
+
+    # ── 4. Tìm thư mục ảnh & mask ─────────────────────────────────
     img_dir = next(
-        (os.path.join(data_dir, d) for d in
-         ["images_gray", "images", "imgs", "bongcan"]
-         if os.path.isdir(os.path.join(data_dir, d))),
-        None,
+        (os.path.join(data_dir, d) for d in ["images_gray", "images", "imgs", "bongcan"]
+         if os.path.isdir(os.path.join(data_dir, d))), None
     )
     mask_dir = next(
-        (os.path.join(data_dir, d) for d in
-         ["masks", "mask", "labels", "annotations", "ground_truth"]
-         if os.path.isdir(os.path.join(data_dir, d))),
-        None,
+        (os.path.join(data_dir, d) for d in ["masks", "mask", "labels", "annotations", "ground_truth"]
+         if os.path.isdir(os.path.join(data_dir, d))), None
     )
 
     if img_dir is None:
@@ -316,57 +405,45 @@ def run_evaluate(
         sys.exit(1)
 
     has_mask = mask_dir is not None
-    print(f"[eval] Ảnh  : {img_dir}")
-    print(f"[eval] Mask : {mask_dir or '(không có → chỉ chạy predict)'}")
-    print(f"[eval] Out  : {out_dir}")
+    print(f"\n[eval] Ảnh : {img_dir}")
+    print(f"[eval] Mask: {mask_dir or '(không có → chỉ predict)'}")
+    print(f"[eval] Out : {out_dir}")
     print(f"{'─'*70}")
 
-    # ── 4. Vòng lặp đánh giá ──────────────────────────────────────
-    all_gt_patch   = []
-    all_pred_patch = []
-    all_gt_pixel   = []
-    all_pred_pixel = []
-    per_image      = []
+    # ── 5. Vòng lặp đánh giá ──────────────────────────────────────
+    all_gt_patch = []; all_pred_patch = []
+    all_gt_pixel = []; all_pred_pixel = []
+    per_image    = []
     n_ok = n_skip = n_fail = 0
 
     for stem in test_stems:
-        img_path = find_file(img_dir, stem)
+        img_path  = find_file(img_dir, stem)
         if img_path is None:
-            print(f"  ⚠ Không thấy ảnh: {stem}")
-            n_skip += 1
-            continue
+            print(f"  ⚠ Không tìm thấy ảnh: {stem}")
+            n_skip += 1; continue
 
         mask_path = find_file(mask_dir, stem) if has_mask else None
         if has_mask and mask_path is None:
-            print(f"  ⚠ Không thấy mask: {stem}")
-            n_skip += 1
-            continue
+            print(f"  ⚠ Không tìm thấy mask: {stem}")
+            n_skip += 1; continue
 
         print(f"\n  → {stem}")
         try:
-            # Load ảnh
-            img_np = np.array(
-                Image.open(img_path).convert("RGB"), dtype=np.uint8
-            )
-            gray = cv2.medianBlur(
-                cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY), ksize=3
-            )
-            H, W = gray.shape
+            img_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+            gray   = cv2.medianBlur(cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY), ksize=3)
+            H, W   = gray.shape
 
-            # Load mask bác sĩ
-            gt_pixel = np.zeros((H, W), dtype=np.uint8)
-            if mask_path:
-                gt_pixel = load_mask_binary(mask_path, H, W)
+            gt_pixel = load_mask_binary(mask_path, H, W) if mask_path else np.zeros((H, W), dtype=np.uint8)
 
-            # Predict (xử lý dual panel)
-            panels = detect_and_split_dual_panel(gray)
-            pred_pixel_full = np.zeros((H, W), dtype=np.uint8)
-            panel_res_list  = []
+            panels            = detect_and_split_dual_panel(gray)
+            pred_pixel_full   = np.zeros((H, W), dtype=np.uint8)
+            panel_res_list    = []
 
             for panel_gray, x_off in panels:
                 ph, pw = panel_gray.shape
                 norm   = normalize(panel_gray)
                 fan, fan_raw = get_fan_mask(norm, thresh=0.05)
+
                 res = predict_panel(
                     norm, fan, fan_raw, model,
                     thr_final, n_theta, n_r,
@@ -376,155 +453,91 @@ def run_evaluate(
                 y1 = min(ph, H)
                 pred_pixel_full[:y1, x_off:x_off + pw] = panel_pred[:y1, :pw]
                 panel_res_list.append(res)
-                print(f"    Panel {pw}×{ph}: {int(res['pred_final'].sum())} patches")
+                print(f"    Panel {pw}×{ph}: {int(res['pred_final'].sum())} patches bóng")
 
-            # Patch-level (panel đầu tiên)
             if panel_res_list:
                 res0   = panel_res_list[0]
                 nr, nc = res0["n_rows"], res0["n_cols"]
                 ph0, pw0 = res0["H"], res0["W"]
-
-                gt_patch   = pixel_to_patch_grid(
-                    gt_pixel[:ph0, :pw0], nr, nc, ph0, pw0, mask_patch_thr
-                )
+                gt_patch   = pixel_to_patch_grid(gt_pixel[:ph0, :pw0], nr, nc, ph0, pw0, mask_patch_thr)
                 pred_patch = (res0["pred_final"] > 0).astype(np.uint8)
-
                 all_gt_patch.extend(gt_patch.ravel().tolist())
                 all_pred_patch.extend(pred_patch.ravel().tolist())
 
-            # Pixel-level
             all_gt_pixel.extend(gt_pixel.ravel().tolist())
             all_pred_pixel.extend(pred_pixel_full.ravel().tolist())
 
-            # Overlap per image
             ovl = compute_overlap(gt_pixel, pred_pixel_full)
-            print(f"    IoU={ovl['iou']:.3f}  Dice={ovl['dice']:.3f}  "
-                  f"Recall={ovl['sensitivity']:.3f}  Prec={ovl['precision']:.3f}")
+            print(f"    IoU={ovl['iou']:.3f} | Dice={ovl['dice']:.3f} | Recall={ovl['sensitivity']:.3f}")
 
-            # Overlay image
-            ov_img = make_overlay_image(
-                gray, gt_pixel, pred_pixel_full, ovl["iou"], stem
-            )
-            cv2.imwrite(
-                os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img
-            )
+            ov_img = make_overlay_image(gray, gt_pixel, pred_pixel_full, ovl["iou"], stem)
+            cv2.imwrite(os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img)
 
             per_image.append({
-                "stem"         : stem,
-                "img_path"     : img_path,
-                "mask_path"    : mask_path,
-                "n_pred_patches": int(
-                    sum(r["n_final"] for r in panel_res_list)
-                ),
+                "stem": stem, "img_path": img_path, "mask_path": mask_path,
+                "n_pred_patches": int(sum(r["n_final"] for r in panel_res_list)),
                 **ovl,
             })
             n_ok += 1
 
         except Exception as e:
-            print(f"    ✗ {e}")
+            print(f"    ✗ Lỗi: {e}")
             traceback.print_exc()
             n_fail += 1
 
     if not all_gt_pixel:
-        print("\n[ERROR] Không có dữ liệu để tính metrics.")
+        print("\n[ERROR] Không có dữ liệu để đánh giá.")
         sys.exit(1)
 
-    # ── 5. Aggregate metrics ───────────────────────────────────────
     y_gt_px   = np.array(all_gt_pixel,   dtype=np.uint8)
     y_pred_px = np.array(all_pred_pixel, dtype=np.uint8)
     y_gt_pa   = np.array(all_gt_patch,   dtype=np.uint8)
     y_pred_pa = np.array(all_pred_patch, dtype=np.uint8)
 
-    m_px = compute_metrics(y_gt_px,   y_pred_px)
-    m_pa = compute_metrics(y_gt_pa,   y_pred_pa) if len(all_gt_patch) > 0 else {}
+    m_px = compute_metrics(y_gt_px, y_pred_px)
+    m_pa = compute_metrics(y_gt_pa, y_pred_pa) if len(all_gt_patch) > 0 else {}
 
-    # Mean per-image overlap
     def _mean(key): return float(np.mean([r[key] for r in per_image]))
-    mean_ovl = {
-        "iou"           : round(_mean("iou"),          4),
-        "dice"          : round(_mean("dice"),         4),
-        "overlap_coeff" : round(_mean("overlap_coeff"),4),
-        "sensitivity"   : round(_mean("sensitivity"),  4),
-        "precision"     : round(_mean("precision"),    4),
-    } if per_image else {}
+    mean_ovl = {k: round(_mean(k), 4) for k in ["iou", "dice", "overlap_coeff", "sensitivity", "precision"]} if per_image else {}
 
-    # ── 6. In kết quả ─────────────────────────────────────────────
-    SEP = "═" * 70
-
+    SEP = "═" * 75
     print(f"\n{SEP}")
-    print(f"  KẾT QUẢ ĐÁNH GIÁ — {n_ok} ảnh test")
-    print(SEP)
+    print(f"  KẾT QUẢ — {n_ok} ảnh test | skip={n_skip} | fail={n_fail}")
+    print(f"{SEP}")
 
     def show_metrics(title, m):
         if not m: return
         print(f"\n  📊 {title}:")
         print(f"  {'Metric':<16} {'Value':>8}  Bar")
-        print(f"  {'─'*45}")
-        targets = ["accuracy","precision","recall","f1","specificity",
-                   "iou","dice","auc","avg_prec"]
-        for k in targets:
+        print(f"  {'─'*50}")
+        for k in ["accuracy", "precision", "recall", "f1", "specificity", "iou", "dice"]:
             v = m.get(k)
             if v is None: continue
             bar = "█" * int(v * 20)
-            ok  = " ✅" if (
-                (k == "recall" and v >= 0.80) or
-                (k == "f1"     and v >= 0.75) or
-                (k == "iou"    and v >= 0.50) or
-                (k == "dice"   and v >= 0.60)
-            ) else ""
-            print(f"  {k:<16} {v:>8.4f}  {bar}{ok}")
+            print(f"  {k:<16} {v:>8.4f}  {bar}")
 
-    show_metrics("Pixel-level metrics (toàn tập)", m_px)
-    show_metrics("Patch-level metrics (toàn tập)", m_pa)
+    show_metrics("Pixel-level", m_px)
+    show_metrics("Patch-level", m_pa)
 
     if mean_ovl:
-        print(f"\n  📐 Trùng khớp mask (trung bình per-image):")
-        print(f"  {'─'*45}")
-        labels = {
-            "iou"           : "IoU (Jaccard)",
-            "dice"          : "Dice coefficient",
-            "overlap_coeff" : "Overlap coefficient",
-            "sensitivity"   : "Sensitivity (Recall)",
-            "precision"     : "Precision",
-        }
-        for k, lbl in labels.items():
-            v = mean_ovl[k]
-            ok = " ✅" if (k == "sensitivity" and v >= 0.80) else ""
-            print(f"  {lbl:<22}: {v*100:>6.1f}%{ok}")
+        print(f"\n  📊 Image-level (mean over {n_ok} ảnh):")
+        for k, v in mean_ovl.items():
+            bar = "█" * int(v * 20)
+            print(f"  {k:<16} {v:>8.4f}  {bar}")
 
-    tp = m_px["tp"]; fp = m_px["fp"]
-    fn = m_px["fn"]; tn = m_px["tn"]
-    print(f"\n  Confusion Matrix (pixel-level):")
-    print(f"  {'─'*40}")
-    print(f"  {'':>14} Pred Neg    Pred Pos")
-    print(f"  GT Negative  {tn:>10,}  {fp:>10,}   spec={tn/max(tn+fp,1):.3f}")
-    print(f"  GT Positive  {fn:>10,}  {tp:>10,}   sens={tp/max(tp+fn,1):.3f}")
-
-    n_det = sum(1 for r in per_image if r["n_pred_patches"] > 0)
-    print(f"\n  Tổng: {n_ok} ảnh OK | {n_skip} bỏ qua | {n_fail} lỗi")
-    print(f"  Model phát hiện shadow: {n_det}/{n_ok} ảnh")
-
-    # ── 7. Lưu JSON ────────────────────────────────────────────────
     output = {
-        "summary": {
-            "n_ok": n_ok, "n_skip": n_skip, "n_fail": n_fail,
-            "n_detected": n_det,
-        },
-        "pixel_metrics" : m_px,
-        "patch_metrics" : m_pa,
-        "mean_overlap"  : mean_ovl,
-        "per_image"     : per_image,
+        "summary":       {"n_ok": n_ok, "n_skip": n_skip, "n_fail": n_fail},
+        "pixel_metrics": m_px,
+        "patch_metrics": m_pa,
+        "mean_overlap":  mean_ovl,
+        "per_image":     per_image,
     }
-    json_path = os.path.join(out_dir, "eval_results.json")
-    with open(json_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     print(f"\n{SEP}")
-    print(f"  ✅ Hoàn thành!")
-    print(f"  📁 Overlays  → {overlay_dir}")
-    print(f"  📄 JSON      → {json_path}")
-    print(SEP)
-
+    print(f"  ✅ Báo cáo → {out_dir}")
+    print(f"{SEP}")
     return output
 
 
@@ -533,32 +546,17 @@ def run_evaluate(
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate shadow detection trên 20% test split"
-    )
-    parser.add_argument(
-        "--data_dir",
-        default=r"C:\Users\ThinkPad\DATN1\Data\bongcan_processed",
-        help="Thư mục bongcan_processed chứa images_gray/, masks/, models/",
-    )
-    parser.add_argument("--thr_final",      default=THR_FINAL,      type=float)
-    parser.add_argument("--n_theta",        default=N_THETA,        type=int)
-    parser.add_argument("--n_r",            default=N_R_SAMPLES,    type=int)
-    parser.add_argument("--te_low_pct",     default=TE_LOW_PCT,     type=int)
-    parser.add_argument("--rf_min",         default=RF_MIN_PROB,    type=float)
-    parser.add_argument("--max_shadow_pct", default=15,             type=int)
-    parser.add_argument("--mask_patch_thr", default=0.30,           type=float,
-        help="Tỉ lệ pixel shadow tối thiểu để patch = positive (default: 0.30)")
+    parser = argparse.ArgumentParser(description="Predict_mask — synced với Train.py 13 features")
+    parser.add_argument("--data_dir",       default=r"C:\Users\ThinkPad\DATN1\Data\bongcan_processed")
+    parser.add_argument("--thr_final",      default=0.55,        type=float,
+                        help="Threshold predict (đồng bộ với Train.py, mặc định 0.55)")
+    parser.add_argument("--n_theta",        default=N_THETA,     type=int)
+    parser.add_argument("--n_r",            default=N_R_SAMPLES, type=int)
+    parser.add_argument("--te_low_pct",     default=TE_LOW_PCT,  type=int)
+    parser.add_argument("--rf_min",         default=RF_MIN_PROB, type=float)
+    parser.add_argument("--max_shadow_pct", default=15,          type=int)
+    parser.add_argument("--mask_patch_thr", default=0.30,        type=float)
     args = parser.parse_args()
-
-    print("=" * 70)
-    print("  EVALUATE — Shadow Detection on 20% Test Split")
-    print("  XANH = Bác sĩ khoanh  |  ĐỎ = Model  |  TÍM = Trùng nhau")
-    print("=" * 70)
-    print(f"  data_dir     : {args.data_dir}")
-    print(f"  thr_final    : {args.thr_final}")
-    print(f"  mask_thr     : {args.mask_patch_thr}")
-    print("=" * 70 + "\n")
 
     run_evaluate(
         data_dir        = args.data_dir,

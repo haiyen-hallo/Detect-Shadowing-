@@ -1,0 +1,6 @@
+Data/ 
+myenv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

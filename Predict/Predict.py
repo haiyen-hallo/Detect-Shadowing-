@@ -1,4 +1,21 @@
+"""
+Predict.py — Shadow Detection (Fan Beam chuẩn + 18 Features)
+============================================================
 
+MÔ HÌNH VẬT LÝ CHUẨN (hình 4):
+  ★ Tâm hội tụ ảo (cx, cy) nằm PHÍA TRÊN bề mặt đầu dò
+    → cy có thể âm (nằm ngoài ảnh), KHÔNG clip về 0
+  ● Bề mặt đầu dò = arc tròn bán kính R từ (cx, cy)
+  → 256 tia đều đi TỪ (cx, cy), bắt đầu TẠI bề mặt (r = R)
+
+3 LỖI ĐÃ FIX so với version trước:
+  1. cy KHÔNG clip về 0 → tâm ảo đúng vị trí phía trên ảnh
+  2. r_arr bắt đầu từ R (bề mặt đầu dò), không phải PATCH_H*0.5
+  3. fill_corridors: get_pts dùng rr trực tiếp (không + thêm R)
+
+Chạy:
+    python Predict.py --test_dir "..." --models_dir "..."
+"""
 
 import os, sys, json, glob, argparse, traceback, warnings
 import numpy as np
@@ -52,6 +69,74 @@ FEATURE_NAMES = [
     "dist_origin_norm", "angle_axis_norm", "ray_mean_above",
     "lateral_drop", "vert_continuity", "reverb_score",
 ]
+
+SHADOW_MAX_MEAN = 0.5
+
+DERIVED_FEATURE_NAMES = [
+    "above_below_ratio",
+    "shadow_drop",
+    "dark_bright_above",
+    "lateral_contrast_nm",
+    "depth_darkness",
+    "vert_dark_depth",
+    "anti_reverb_dark",
+    "phys_shadow_score",
+]
+
+
+def engineer_probe_features(X, feature_names):
+    """Add the same 8 probe-derived features used in Model/Train.py."""
+    fn = {name: i for i, name in enumerate(feature_names)}
+    eps = 1e-6
+
+    def col(name):
+        return X[:, fn[name]].astype(np.float64) if name in fn else np.zeros(len(X))
+
+    mean      = col("mean")
+    ray_above = col("ray_mean_above")
+    lat_drop  = col("lateral_drop")
+    vert_cont = col("vert_continuity")
+    reverb    = col("reverb_score")
+    dist_norm = col("dist_origin_norm")
+
+    above_below = np.clip(ray_above / (mean + eps), 0.0, 10.0)
+    shadow_drop = np.clip(ray_above - mean, 0.0, 1.0)
+    darkness = np.clip(SHADOW_MAX_MEAN - mean, 0.0, SHADOW_MAX_MEAN) / SHADOW_MAX_MEAN
+    dark_bright = darkness * np.clip(ray_above, 0.0, 1.0)
+    lat_norm = np.clip(lat_drop / (mean + eps), -2.0, 5.0)
+    depth_dark = dist_norm * np.clip(1.0 - mean, 0.0, 1.0)
+    vert_depth = vert_cont * dist_norm
+    anti_reverb = np.clip(1.0 - reverb, 0.0, 1.0) * np.clip(1.0 - mean, 0.0, 1.0)
+    phys = np.clip(above_below / 5.0, 0.0, 1.0) * shadow_drop * darkness
+
+    new_cols = np.column_stack([
+        above_below, shadow_drop, dark_bright, lat_norm,
+        depth_dark, vert_depth, anti_reverb, np.clip(phys, 0.0, 1.0),
+    ]).astype(np.float32)
+    new_cols = np.nan_to_num(new_cols, nan=0., posinf=1., neginf=-1.)
+    return np.hstack([X, new_cols]), feature_names + DERIVED_FEATURE_NAMES
+
+
+def expected_n_features(model):
+    """Return fitted sklearn feature count for direct estimators/pipelines."""
+    if hasattr(model, "n_features_in_"):
+        return int(model.n_features_in_)
+    if hasattr(model, "named_steps"):
+        for step in model.named_steps.values():
+            n = expected_n_features(step)
+            if n is not None:
+                return n
+    if hasattr(model, "named_estimators_"):
+        for est in model.named_estimators_.values():
+            n = expected_n_features(est)
+            if n is not None:
+                return n
+    if hasattr(model, "estimators_"):
+        for est in model.estimators_:
+            n = expected_n_features(est)
+            if n is not None:
+                return n
+    return None
 
 
 def load_model(models_dir):
@@ -340,6 +425,14 @@ def precompute_all_patches(norm_img, fan_mask, cx, cy, R, model):
 
     X=np.stack([f[k].ravel() for k in FEATURE_NAMES],axis=1).astype(np.float32)
     X=np.nan_to_num(X,nan=0.,posinf=1.,neginf=-1.)
+    n_expected = expected_n_features(model)
+    if n_expected == X.shape[1] + len(DERIVED_FEATURE_NAMES):
+        X, _ = engineer_probe_features(X, FEATURE_NAMES)
+    elif n_expected is not None and n_expected != X.shape[1]:
+        raise ValueError(
+            f"Model expects {n_expected} features, but Predict.py built "
+            f"{X.shape[1]}. Check feature engineering/model version."
+        )
     ysc=model.predict_proba(X)[:,1]
     ysc[~inf.ravel()]=0.0
     return ysc.reshape(n_rows,n_cols), pm, inf, n_rows, n_cols
