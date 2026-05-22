@@ -33,48 +33,35 @@ except ImportError as e:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ★ ĐỒNG BỘ HOÀN TOÀN VỚI Train.py MỚI (13 features)
+# ★ ĐỒNG BỘ HOÀN TOÀN VỚI Train.py MỚI (9 features)
 # ═══════════════════════════════════════════════════════════════════
 
 # [SYNC] Ngưỡng tối tuyệt đối — phải khớp Train.py
 ABSOLUTE_DARK_THRESHOLD = 0.38
 
-# [SYNC] 13 features — phải khớp SELECTED_FEATURES trong Train.py
+# [SYNC] 9 features cốt lõi — phải khớp CHÍNH XÁC SELECTED_FEATURES trong Train.py
 SELECTED_FEATURES = [
-    # Positional
-    "row_ratio", "angle_axis_norm", "col_ratio",
-    # Core intensity
-    "mean", "contrast", "ray_mean_above",
-    # Continuity
-    "vert_continuity",
-    # Derived cũ
-    "depth_darkness", "is_shadow_candidate", "ray_dark_context",
-    # ★ NEW 3 features — thêm vào để khớp model mới
+    # --- Positional ---
+    "row_ratio", "col_ratio",
+    # --- Core intensity signals ---
+    "mean", "contrast",
+    # --- Texture GLCM Features ---
+    "homogeneity", "energy", "correlation", "entropy",
+    # --- Absolute darkness gate ---
     "absolute_dark",
-    "vray_dark_score",
-    "shadow_zone_score",
 ]
 
-# [SYNC] 16 derived features — phải khớp DERIVED_FEATURE_NAMES trong Train.py
+# [SYNC] Các đặc trưng phái sinh — phải khớp DERIVED_FEATURE_NAMES trong Train.py
 DERIVED_FEATURE_NAMES = [
-    # 13 cũ
-    "above_below_ratio", "shadow_drop", "dark_bright_above",
-    "lateral_contrast_nm", "depth_darkness", "vert_dark_depth",
-    "anti_reverb_dark", "phys_shadow_score",
-    "col_dark_score", "depth_col_dark",
-    "is_shadow_candidate", "shadow_contrast",
-    "ray_dark_context",
-    # ★ 3 mới
+    "col_dark_score",
     "absolute_dark",
-    "vray_dark_score",
-    "shadow_zone_score",
 ]
 
 
 def engineer_probe_features_predict(X: np.ndarray, feature_names: list) -> tuple:
     """
-    [SYNC] Phải giống hệt hàm engineer_probe_features() trong Train.py.
-    Thêm 3 features mới: absolute_dark, vray_dark_score, shadow_zone_score.
+    [SYNC] Phiên bản ĐÃ LOẠI BỎ GEOMETRIC.
+    Phải giống hệt hàm engineer_probe_features() trong Train.py mới.
     """
     fn  = {name: i for i, name in enumerate(feature_names)}
     eps = 1e-6
@@ -82,47 +69,21 @@ def engineer_probe_features_predict(X: np.ndarray, feature_names: list) -> tuple
         return X[:, fn[name]].astype(np.float64) if name in fn else np.zeros(len(X), np.float64)
 
     mean      = _c("mean")
-    ray_above = _c("ray_mean_above")
-    lat_drop  = _c("lateral_drop")
-    vert_cont = _c("vert_continuity")
-    reverb    = _c("reverb_score")
-    dist_norm = _c("dist_origin_norm")
     row_ratio = _c("row_ratio")
 
     # Adaptive max mean (tính trên toàn panel — giống lúc predict đơn panel)
     adaptive_max_mean = np.clip(np.median(mean) * 0.85, 0.15, 0.50) if len(mean) > 0 else 0.30
 
-    darkness    = np.clip((adaptive_max_mean - mean) / (adaptive_max_mean + eps), 0.0, 1.0)
-    above_below = np.clip(ray_above / (mean + eps), 0.0, 10.0)
-    shadow_drop = np.clip(ray_above - mean, 0.0, 1.0)
-    dark_bright = darkness * np.clip(ray_above, 0.0, 1.0)
-    lat_norm    = np.clip(lat_drop / (mean + eps), -2.0, 5.0)
-    depth_dark  = dist_norm * np.clip(1.0 - mean, 0.0, 1.0)
-    vert_depth  = vert_cont * dist_norm
-    anti_reverb = np.clip(1.0 - reverb, 0.0, 1.0) * np.clip(1.0 - mean, 0.0, 1.0)
-    phys        = np.clip(np.clip(above_below / 5.0, 0.0, 1.0) * shadow_drop * darkness, 0.0, 1.0)
-    col_dark    = darkness * np.clip(0.4 + 0.6 * row_ratio, 0.4, 1.0)
-    depth_col   = dist_norm * col_dark
-
-    # [SYNC FIX] is_shadow_candidate — thêm absolute gate (giống Train.py mới)
-    abs_gate  = np.clip((ABSOLUTE_DARK_THRESHOLD - mean) / (ABSOLUTE_DARK_THRESHOLD + eps), 0.0, 1.0)
-    is_shadow = abs_gate * darkness * np.clip((above_below - 1.0) / 2.0, 0.0, 1.0)
-
-    shadow_cont      = np.clip(above_below / 5.0, 0.0, 1.0) * np.clip(lat_drop, 0.0, 1.0)
-    ray_dark_context = np.clip(vert_cont * darkness * np.clip(ray_above, 0.0, 1.0), 0.0, 1.0)
-
-    # ★ [SYNC] 3 features mới — bắt buộc phải có để khớp model 13 features
-    absolute_dark     = np.clip((ABSOLUTE_DARK_THRESHOLD - mean) / (ABSOLUTE_DARK_THRESHOLD + eps), 0.0, 1.0)
-    bright_above_sig  = np.clip((ray_above - 0.35) / (0.35 + eps), 0.0, 1.0)
-    current_dark_sig  = np.clip((0.40 - mean) / (0.40 + eps), 0.0, 1.0)
-    vray_dark_score   = np.clip(bright_above_sig * current_dark_sig * vert_cont, 0.0, 1.0)
-    shadow_zone_score = np.clip(ray_above * vert_cont * np.clip(1.0 - mean, 0.0, 1.0), 0.0, 1.0)
+    # Tính toán đặc trưng phái sinh (thuần cường độ, không dùng hình học)
+    darkness = np.clip((adaptive_max_mean - mean) / (adaptive_max_mean + eps), 0.0, 1.0)
+    col_dark = darkness * np.clip(0.4 + 0.6 * row_ratio, 0.4, 1.0)
+    
+    # Gate chặn speckle sáng
+    absolute_dark = np.clip((ABSOLUTE_DARK_THRESHOLD - mean) / (ABSOLUTE_DARK_THRESHOLD + eps), 0.0, 1.0)
 
     new = np.column_stack([
-        above_below, shadow_drop, dark_bright, lat_norm, depth_dark, vert_depth, anti_reverb,
-        phys, col_dark, depth_col, is_shadow, shadow_cont, ray_dark_context,
-        # ★ 3 mới
-        absolute_dark, vray_dark_score, shadow_zone_score,
+        col_dark,       
+        absolute_dark,  
     ]).astype(np.float32)
 
     return np.hstack([X, np.nan_to_num(new, nan=0., posinf=1., neginf=-1.)]), feature_names + DERIVED_FEATURE_NAMES
@@ -135,7 +96,7 @@ def select_features_predict(X: np.ndarray, feature_names: list, selected: list =
     missing = [s for s in selected if s not in fn_map]
     if missing:
         raise ValueError(f"[FeatureSync] Thiếu features: {missing}. "
-                         f"Kiểm tra engineer_probe_features_predict() có đủ 16 derived features không.")
+                         f"Hãy đảm bảo dataset.npz hoặc luồng Predict.py đã trích xuất đủ các đặc trưng GLCM.")
     idx = [fn_map[s] for s in selected]
     return X[:, idx].astype(X.dtype, copy=False)
 
@@ -147,8 +108,8 @@ def select_features_predict(X: np.ndarray, feature_names: list, selected: list =
 class FeatureAdaptedModelWrapper:
     """
     Bọc model để tự động:
-      raw features (18) → engineer (18+16=34) → select (13) → model.predict_proba
-    Đảm bảo khớp 100% với pipeline Train.py.
+      raw features → engineer → select (9 features) → model.predict_proba
+    Đảm bảo khớp 100% với pipeline Train.py mới.
     """
     def __init__(self, raw_model, raw_feature_names):
         self.model             = raw_model
@@ -164,7 +125,8 @@ class FeatureAdaptedModelWrapper:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FILE UTILS
+# FILE UTILS & VISUALIZATION & METRICS
+# (Giữ nguyên toàn bộ logic đánh giá, xử lý ảnh của bạn)
 # ═══════════════════════════════════════════════════════════════════
 
 IMG_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".JPG", ".JPEG", ".PNG", ".BMP"]
@@ -182,13 +144,11 @@ def find_file(folder: str, stem: str):
         pass
     return None
 
-
 def load_mask_binary(mask_path: str, H: int, W: int) -> np.ndarray:
     img = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
     if img.shape != (H, W):
         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_NEAREST)
     return (img > 10).astype(np.uint8)
-
 
 def pred_grid_to_pixel(pred_grid: np.ndarray, H: int, W: int) -> np.ndarray:
     n_rows, n_cols = pred_grid.shape
@@ -201,7 +161,6 @@ def pred_grid_to_pixel(pred_grid: np.ndarray, H: int, W: int) -> np.ndarray:
                 pixel[y0:y1, x0:x1] = 1
     return pixel
 
-
 def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
                          H: int, W: int, thr: float = 0.30) -> np.ndarray:
     grid = np.zeros((n_rows, n_cols), dtype=np.uint8)
@@ -213,11 +172,6 @@ def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
             if patch.size > 0 and float(patch.mean()) >= thr:
                 grid[r, c] = 1
     return grid
-
-
-# ═══════════════════════════════════════════════════════════════════
-# VISUALIZATION
-# ═══════════════════════════════════════════════════════════════════
 
 def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
     H, W   = gray.shape
@@ -270,11 +224,6 @@ def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
     sep = np.full((H, 4, 3), 60, dtype=np.uint8)
     return np.hstack([base, sep, canvas, sep, legend])
 
-
-# ═══════════════════════════════════════════════════════════════════
-# METRICS
-# ═══════════════════════════════════════════════════════════════════
-
 def compute_metrics(y_true, y_pred):
     acc  = float(accuracy_score(y_true, y_pred))
     f1   = float(f1_score(y_true, y_pred, zero_division=0))
@@ -294,7 +243,6 @@ def compute_metrics(y_true, y_pred):
         "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
         "n_pos": int(y_true.sum()), "n_neg": int((y_true == 0).sum()),
     }
-
 
 def compute_overlap(gt, pred):
     inter   = int(((gt == 1) & (pred == 1)).sum())
@@ -319,7 +267,7 @@ def compute_overlap(gt, pred):
 
 def run_evaluate(
     data_dir        : str,
-    thr_final       : float = 0.55,   # [SYNC] Hạ xuống 0.55 cho model mới
+    thr_final       : float = 0.55,
     n_theta         : int   = N_THETA,
     n_r             : int   = N_R_SAMPLES,
     te_low_pct      : int   = TE_LOW_PCT,
@@ -356,8 +304,6 @@ def run_evaluate(
         sys.exit(1)
 
     # ── 3. Load feature names từ dataset.npz ─────────────────────
-    # [KEY FIX] Load đặc trưng gốc từ npz (18 features từ Noise.py)
-    # KHÔNG dùng SELECTED_FEATURES ở đây — đó là đặc trưng SAU khi engineer
     npz_candidates = [
         os.path.join(data_dir, "dataset.npz"),
         os.path.join(os.path.dirname(data_dir), "dataset.npz"),
@@ -368,26 +314,19 @@ def run_evaluate(
             d = np.load(npz_path, allow_pickle=True)
             raw_feature_names = [str(s) for s in d["feature_names"]]
             print(f"[eval] Loaded {len(raw_feature_names)} raw features từ: {npz_path}")
-            print(f"       Features: {raw_feature_names}")
             break
 
     if raw_feature_names is None:
-        # Fallback: dùng tên chuẩn từ Noise.py
+        # Tên chuẩn fallback (chú ý: phải có 4 GLCM features nếu Noise.py đã sinh ra)
         raw_feature_names = [
-            "contrast", "homogeneity", "correlation", "energy",
-            "mean", "std", "skewness", "entropy",
-            "row_ratio", "col_ratio", "local_contrast", "below_bright",
-            "dist_origin_norm", "angle_axis_norm", "ray_mean_above",
-            "lateral_drop", "vert_continuity", "reverb_score",
+            "mean", "std", "contrast", "homogeneity", "correlation", "energy", "entropy",
+            "row_ratio", "col_ratio", "local_contrast", "below_bright"
         ]
-        print(f"[eval] ⚠ Không tìm thấy dataset.npz → dùng fallback 18 features từ Noise.py")
+        print(f"[eval] ⚠ Không tìm thấy dataset.npz → dùng fallback raw features")
 
-    # Xác nhận model nhận đúng số features
     expected_n = len(SELECTED_FEATURES)
     print(f"\n[eval] Pipeline: {len(raw_feature_names)} raw → engineer → {expected_n} selected → model")
-    print(f"[eval] SELECTED_FEATURES ({expected_n}): {SELECTED_FEATURES}")
-
-    # Bọc model với wrapper tự động engineer features
+    
     model = FeatureAdaptedModelWrapper(raw_model, raw_feature_names)
 
     # ── 4. Tìm thư mục ảnh & mask ─────────────────────────────────
@@ -419,12 +358,10 @@ def run_evaluate(
     for stem in test_stems:
         img_path  = find_file(img_dir, stem)
         if img_path is None:
-            print(f"  ⚠ Không tìm thấy ảnh: {stem}")
             n_skip += 1; continue
 
         mask_path = find_file(mask_dir, stem) if has_mask else None
         if has_mask and mask_path is None:
-            print(f"  ⚠ Không tìm thấy mask: {stem}")
             n_skip += 1; continue
 
         print(f"\n  → {stem}")
@@ -546,7 +483,7 @@ def run_evaluate(
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict_mask — synced với Train.py 13 features")
+    parser = argparse.ArgumentParser(description="Predict_mask — synced với Train.py GLCM (No Geometric)")
     parser.add_argument("--data_dir",       default=r"C:\Users\ThinkPad\DATN1\Data\bongcan_processed")
     parser.add_argument("--thr_final",      default=0.55,        type=float,
                         help="Threshold predict (đồng bộ với Train.py, mặc định 0.55)")

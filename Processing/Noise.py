@@ -1,7 +1,6 @@
 import os, sys, json, glob, base64, argparse, io
 import numpy as np
 from pathlib import Path
-from io import BytesIO
 from PIL import Image, ImageDraw
 import cv2
 import matplotlib.pyplot as plt
@@ -11,21 +10,16 @@ PATCH_H          = 16
 PATCH_W          = 16
 GLCM_BINS        = 32
 
-# Tên features
-FEATURE_NAMES_BASE = [
+# 12 đặc trưng cơ bản + 3 đặc trưng ngữ cảnh cột (column-context)
+FEATURE_NAMES = [
     "contrast","homogeneity","correlation","energy",
     "mean","std","skewness","entropy",
     "row_ratio","col_ratio","local_contrast","below_bright",
+    # [NEW] Column-context: phản ánh nguyên lý vật lý bóng cản
+    "above_max_mean",   # độ sáng cực đại phía trên cùng cột (reflector siêu âm)
+    "col_dark_ratio",   # mức tối tương đối so với trung bình cột
+    "mean_drop",        # độ sụt giảm mean đột ngột từ patch phía trên
 ]
-FEATURE_NAMES_GEO = [
-    "dist_origin_norm",   # khoảng cách probe→patch, normalized
-    "angle_axis_norm",    # góc lệch so với trục giữa fan [-1, 1]
-    "ray_mean_above",     # mean intensity phía trên patch theo tia
-    "lateral_drop",       # mức độ tối hơn lân cận ngang
-    "vert_continuity",    # liên tục tối theo cột dưới patch
-    "reverb_score",       # tỉ lệ pixel sáng trong cột tối (reverberation)
-]
-FEATURE_NAMES = FEATURE_NAMES_BASE + FEATURE_NAMES_GEO
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -78,7 +72,7 @@ def find_json_files(data_root):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PREPROCESSING — GIỐNG FILE GỐC (ĐÃ LOẠI BỎ CROP_FAN_REGION)
+# PREPROCESSING CƠ BẢN
 # ═══════════════════════════════════════════════════════════════════
 
 def to_grayscale(img_rgb):
@@ -89,94 +83,6 @@ def normalize(gray):
     img = gray.astype(np.float32)
     lo, hi = float(img.min()), float(img.max())
     return (img-lo)/(hi-lo) if hi-lo > 1e-6 else np.zeros_like(img)
-
-
-def get_fan_mask_norm(norm_img, thresh=0.05):
-    """Fan mask từ normalized image, thresh=0.05 (giống file gốc và Predict.py)."""
-    bw = ((norm_img > thresh) * 255).astype(np.uint8)
-    k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,  k)
-    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask = np.zeros_like(bw)
-    if cnts:
-        cv2.drawContours(mask, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
-    ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (PATCH_H, PATCH_H))
-    return cv2.erode(mask, ek, iterations=1)
-
-
-def detect_probe_origin(fan_mask):
-    """
-    Tâm đầu dò = trung điểm 2 đỉnh trên cùng fan mask.
-    Dùng cho geometric features.
-    """
-    H, W   = fan_mask.shape
-    ys, xs = np.where(fan_mask > 0)
-
-    def _fallback():
-        counts   = np.bincount(ys,minlength=H) if len(ys)>0 else np.zeros(H)
-        vrows    = np.where(counts>=8)[0]
-        y_top    = int(vrows[0]) if len(vrows) else 0
-        cx_f     = W/2.0
-        fan_w_f  = float(np.percentile(xs,98)-np.percentile(xs,2)) \
-                   if len(xs)>0 else W*0.8
-        cy_f     = y_top - fan_w_f*0.25    # phía trên arc
-        R_f      = fan_w_f*0.55
-        return cx_f, cy_f, R_f, -np.radians(65), np.radians(65)
-
-    if len(ys) < 50:
-        return _fallback()
-
-    top_pts = []
-    for col in range(W):
-        col_rows = ys[xs == col]
-        if len(col_rows) > 0:
-            top_pts.append((float(col), float(col_rows.min())))
-    if len(top_pts) < 10:
-        return _fallback()
-
-    raw_x = np.array([p[0] for p in top_pts])
-    raw_y = np.array([p[1] for p in top_pts])
-    k_sm  = max(1, len(raw_y)//25)
-    raw_y = np.convolve(raw_y, np.ones(k_sm)/k_sm, mode='same')
-
-    n = len(raw_x); m = max(2, int(n*0.08))
-    px = raw_x[m:n-m]; py = raw_y[m:n-m]
-    if len(px) < 6:
-        return _fallback()
-
-    # Kasa circle fit
-    A = np.column_stack([2*px, 2*py, np.ones(len(px))])
-    b = px**2 + py**2
-    try:
-        res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        cx = float(res[0])
-        cy = float(res[1])
-        R  = float(np.sqrt(max(res[2]+cx**2+cy**2, 1.0)))
-
-        cx = float(np.clip(cx, W*0.05, W*0.95))
-
-        cy_min_arc = float(py.min())
-        fan_width  = float(px.max()-px.min())
-        if cy > cy_min_arc:
-            cy = cy_min_arc - fan_width*0.25
-            R  = float(np.sqrt(((px-cx)**2+(py-cy)**2).mean()))
-
-        if R < PATCH_H or R > max(H,W)*5:
-            return _fallback()
-
-    except Exception:
-        return _fallback()
-
-    phi_left  = float(np.arctan2(px[0]-cx,  py[0]-cy))
-    phi_right = float(np.arctan2(px[-1]-cx, py[-1]-cy))
-    if phi_left > phi_right:
-        phi_left, phi_right = phi_right, phi_left
-
-    theta1 = np.radians(90.0) - abs(phi_left)
-    scan   = phi_right - phi_left
-
-    return cx, cy, R, phi_left, phi_right
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -239,20 +145,8 @@ def _build_glcm(patch_q, bins):
     return glcm
 
 
-def _sample_ray_vals(norm_img, ox, oy, px, py, t0, t1, n=20):
-    H, W = norm_img.shape
-    dx = px - ox; dy = py - oy
-    vals = []
-    for i in range(n):
-        t  = t0 + (t1-t0)*i/max(n-1, 1)
-        sx = int(round(ox + dx*t))
-        sy = int(round(oy + dy*t))
-        if 0 <= sx < W and 0 <= sy < H:
-            vals.append(float(norm_img[sy, sx]))
-    return np.array(vals, dtype=np.float32) if vals else np.zeros(1)
-
-
-def compute_patch_features(norm_img, fan_mask, mask, patch_h, patch_w, bins):
+def compute_patch_features(norm_img, mask, patch_h, patch_w, bins):
+    # ĐÃ XÓA parameter fan_mask
     H, W   = norm_img.shape
     n_rows = H // patch_h
     n_cols = W // patch_w
@@ -268,19 +162,7 @@ def compute_patch_features(norm_img, fan_mask, mask, patch_h, patch_w, bins):
     nbr     = cv2.GaussianBlur(norm_img, (ks,ks), sigmaX=ks/3.0)
     bright  = (norm_img > 0.70).astype(np.float32)
 
-    origin  = detect_probe_origin(fan_mask)
-    ox, oy  = float(origin[0]), float(origin[1])
-
-    ys_fan, xs_fan = np.where(fan_mask > 0)
-    if len(xs_fan) > 0:
-        fan_diag = float(np.sqrt(((xs_fan - ox)**2 + (ys_fan - oy)**2).max()))
-        fan_cx   = float(xs_fan.mean())
-        fan_half_w = max(float(xs_fan.max() - xs_fan.min()) / 2.0, 1.0)
-    else:
-        fan_diag   = float(max(H, W))
-        fan_cx     = W / 2.0
-        fan_half_w = W / 2.0
-
+    # Tất cả feature grids (kể cả 3 feature cột mới — sẽ được điền sau vòng lặp)
     f = {k: np.zeros((n_rows, n_cols), dtype=np.float64) for k in FEATURE_NAMES}
     label_p = np.zeros((n_rows, n_cols), dtype=np.int32)
     coverage_p = np.zeros((n_rows, n_cols), dtype=np.float32)
@@ -327,43 +209,31 @@ def compute_patch_features(norm_img, fan_mask, mask, patch_h, patch_w, bins):
             ab = bright[:r*patch_h, x0:x1] if r > 0 else np.zeros((1,1))
             f["below_bright"][r,c]   = float(ab.mean()) if ab.size else 0.0
 
-            py_c = (r + 0.5) * patch_h
-            px_c = (c + 0.5) * patch_w
-            dx   = px_c - ox; dy = py_c - oy
-            dist = float(np.sqrt(dx**2 + dy**2))
+    # ─── POST-LOOP: 3 đặc trưng ngữ cảnh cột ─────────────────────────────────
+    # Tính sau vòng lặp chính vì phụ thuộc vào f["mean"] đã hoàn chỉnh
+    mean_grid = f["mean"]                             # (n_rows, n_cols)
+    col_mean  = mean_grid.mean(axis=0)                # (n_cols,)  trung bình cột
 
-            f["dist_origin_norm"][r,c] = dist / (fan_diag + 1e-6)
-            f["angle_axis_norm"][r,c] = (px_c - fan_cx) / (fan_half_w + 1e-6)
+    for c in range(n_cols):
+        cm = col_mean[c]
+        for r in range(n_rows):
+            cur = mean_grid[r, c]
 
-            if dist > patch_h:
-                above_v = _sample_ray_vals(norm_img, ox, oy, px_c, py_c, 0.10, 0.85, n=20)
-                f["ray_mean_above"][r,c] = float(above_v.mean())
+            # above_max_mean: độ sáng tối đa của các patch phía trên trong cột
+            # → capture hyperechoic reflector; bóng cản thật luôn có reflector sáng phía trên
+            if r > 0:
+                f["above_max_mean"][r, c] = float(mean_grid[:r, c].max())
+            # r==0 giữ nguyên 0.0
 
-                nbr_lat = []
-                for dc in [-2, -1, 1, 2]:
-                    nc = c + dc
-                    if 0 <= nc < n_cols:
-                        nbr_lat.append(float(norm_img[y0:y1, nc*patch_w:(nc+1)*patch_w].mean()))
-                if nbr_lat:
-                    f["lateral_drop"][r,c] = float(np.mean(nbr_lat)) - m_val
-                else:
-                    f["lateral_drop"][r,c] = 0.0
+            # col_dark_ratio: patch này tối hơn trung bình cột bao nhiêu (0→1)
+            # → phân biệt bóng cản (tối liên tục dọc cột) với speckle ngẫu nhiên
+            f["col_dark_ratio"][r, c] = float(np.clip((cm - cur) / (cm + 1e-6), 0., 1.))
 
-                below_v = _sample_ray_vals(norm_img, ox, oy, px_c, py_c, 1.05, 1.60, n=20)
-                f["vert_continuity"][r,c] = float((below_v < 0.40).sum()) / max(len(below_v), 1)
-
-                full_col_v = _sample_ray_vals(norm_img, ox, oy, px_c, py_c, 0.80, 1.60, n=30)
-                col_dark   = float((full_col_v < 0.40).mean())
-                col_bright = float((full_col_v > 0.60).mean())
-                if col_dark > 0.5:
-                    f["reverb_score"][r,c] = col_bright
-                else:
-                    f["reverb_score"][r,c] = 0.0
-            else:
-                f["ray_mean_above"][r,c]  = m_val
-                f["lateral_drop"][r,c]    = 0.0
-                f["vert_continuity"][r,c] = 0.0
-                f["reverb_score"][r,c]    = 0.0
+            # mean_drop: sụt giảm mean đột ngột từ patch liền trên → patch hiện tại
+            # → dấu hiệu khởi đầu bóng cản (chuyển từ sáng sang tối)
+            if r > 0:
+                f["mean_drop"][r, c] = float(np.clip(mean_grid[r-1, c] - cur, 0., 1.))
+            # r==0 giữ nguyên 0.0
 
     patch_features = np.stack([f[k].ravel() for k in FEATURE_NAMES], axis=1).astype(np.float32)
     patch_labels   = label_p.ravel().astype(np.int32)
@@ -384,7 +254,6 @@ def compute_patch_features(norm_img, fan_mask, mask, patch_h, patch_w, bins):
 
     maps = {k: _up(_u8(f[k])) for k in FEATURE_NAMES}
     maps["patch_label"]   = _up((label_p*255).astype(np.uint8))
-    maps["origin"]        = origin
 
     return {
         **maps,
@@ -416,7 +285,7 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
 
     print(f"\n{'─'*65}")
     print(f"  {len(json_files)} file  patch={patch_h}×{patch_w}  bins={GLCM_BINS}")
-    print(f"  Features: {len(FEATURE_NAMES)} (12 gốc + {len(FEATURE_NAMES_GEO)} geometric)")
+    print(f"  Features: {len(FEATURE_NAMES)} (Base Features)")
     print(f"  crop_fan : ĐÃ LOẠI BỎ (Dùng ảnh kích thước gốc 100%)")
     print(f"  Label rule: coverage > 0")
     print(f"{'─'*65}")
@@ -493,7 +362,6 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
             H_img, W_img = gray_clean.shape
             norm_img     = normalize(gray_clean)
 
-            fan_mask = get_fan_mask_norm(norm_img, thresh=0.05)
             meta_d = {"scale": 1., "pad_x": 0, "pad_y": 0, "new_w": W_img, "new_h": H_img}
 
             # Tạo Mask - KHÔNG truyền crop_x, crop_y -> Khớp 100% tọa độ
@@ -508,7 +376,7 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
                 continue
 
             print(f"  → {stem}  ({W_img}×{H_img}) {bc_count} poly:")
-            feats = compute_patch_features(norm_img, fan_mask, mask, patch_h, patch_w, GLCM_BINS)
+            feats = compute_patch_features(norm_img, mask, patch_h, patch_w, GLCM_BINS)
 
             all_features.append(feats["patch_features"])
             all_labels.append(feats["patch_labels"])
@@ -521,11 +389,11 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
             Image.fromarray(feats["patch_label"]).save(os.path.join(plabel_dir, stem + ".png"))
             Image.fromarray(mask).save(os.path.join(mask_dir, stem + ".png"))
 
-            for fn in ["contrast", "mean", "local_contrast", "lateral_drop", "vert_continuity", "reverb_score"]:
+            # Tạm thời chỉ lưu 3 loại feature map chính để kiểm tra
+            for fn in ["contrast", "mean", "local_contrast"]:
                 if fn in feats and isinstance(feats[fn], np.ndarray):
                     Image.fromarray(feats[fn]).save(os.path.join(feat_dir, f"{stem}_{fn}.png"))
 
-            origin = feats.get("origin", (W_img//2, 0))
             plv = np.zeros((H_img, W_img, 3), dtype=np.uint8)
             plv[feats["patch_label"] > 0] = (30, 30, 160)
             
@@ -534,7 +402,7 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
             
             cnts_m, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(plv, cnts_m, -1, (0,220,80), 2)
-            cv2.circle(plv, (int(origin[0]), int(origin[1])), 6, (0,220,220), -1)
+            # ĐÃ XÓA vẽ tâm origin
 
             gray_bgr = cv2.cvtColor(gray_clean, cv2.COLOR_GRAY2BGR)
             cmp = np.hstack([
@@ -576,9 +444,9 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Noise.py — 18 Features + Polygon Shadow Mask")
-    parser.add_argument("--data", default=r"C:\Users\ThinkPad\DATN1\Data\bongcan")
-    parser.add_argument("--output", default=r"C:\Users\ThinkPad\DATN1\Data\bongcan_processed")
+    parser = argparse.ArgumentParser(description="Noise.py — 12 Base Features + Polygon Shadow Mask")
+    parser.add_argument("--data", default=r"C:\Users\ThinkPad\Graduation project\Data\bongcan")
+    parser.add_argument("--output", default=r"C:\Users\ThinkPad\Graduation project\Data\bongcan_processed")
     parser.add_argument("--patch_h", default=PATCH_H, type=int)
     parser.add_argument("--patch_w", default=PATCH_W, type=int)
     parser.add_argument("--debug", action="store_true")

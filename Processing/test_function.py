@@ -61,8 +61,8 @@ def detect_probe_origin_geometric(img_gray, patch_h=32, bright_thresh=15):
     H, W = img_gray.shape
 
     # Bước 1: Hai điểm trên cung trên
-    xa = int(0.3* W)
-    xb = int(0.35 * W)
+    xa = int(0.35* W)
+    xb = int(0.2 * W)
     ya = _find_top_transition(img_gray, xa, bright_thresh)
     yb = _find_top_transition(img_gray, xb, bright_thresh)
 
@@ -241,5 +241,5 @@ def view_ultrasound_processing(image_path):
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # Đường dẫn ảnh được nạp sẵn
-    YOUR_IMAGE_PATH = r"C:\Users\ThinkPad\DATN1\Data\bongcan\2400136440_006\2400136440_006.jpg"
+    YOUR_IMAGE_PATH = r"C:\Users\ThinkPad\DATN\Data\bongcan\2400018899_004\2400018899_004_right.jpg"
     view_ultrasound_processing(YOUR_IMAGE_PATH)

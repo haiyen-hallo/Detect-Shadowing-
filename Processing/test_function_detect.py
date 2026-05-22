@@ -1,3 +1,4 @@
+r""""""
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -238,6 +239,7 @@ if img is not None:
     plt.show()
 else:
     print("Vui lòng kiểm tra lại đường dẫn ảnh!") 
+ 
 
 
 
