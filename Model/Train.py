@@ -689,6 +689,35 @@ def evaluate_on_test(name, model, X_te, y_te, stems_te, feature_names,
 # MAIN RUN
 # ═══════════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════════
+# MODEL CONFIG — lưu/đọc để Predict_mask.py tự động sync features
+# ═══════════════════════════════════════════════════════════════════
+
+def _save_model_config(out_dir: str, feature_names: list, threshold: float, model_type: str):
+    """
+    Lưu model_config.json sau khi train xong.
+    Predict_mask.py đọc file này để biết chính xác:
+      - selected_features: danh sách features đúng thứ tự model expect
+      - val_threshold    : threshold tối ưu từ CV hoặc manual
+      - n_features       : số features model expect (để validate)
+      - absolute_dark_threshold, derived_feature_names: để engineer đúng
+    """
+    config = {
+        "selected_features":       list(feature_names),
+        "derived_feature_names":   DERIVED_FEATURE_NAMES,
+        "absolute_dark_threshold": ABSOLUTE_DARK_THRESHOLD,
+        "val_threshold":           round(float(threshold), 4),
+        "n_features":              len(feature_names),
+        "model_type":              model_type,
+        "col_context_features":    ["above_max_mean", "col_dark_ratio", "mean_drop"],
+    }
+    path = os.path.join(out_dir, "model_config.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"  [Saved] model_config.json → {path}")
+    print(f"          features={len(feature_names)}: {feature_names}")
+
 def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
         do_cv: bool = False, use_fhl: bool = True, manual_thr: float = 0.55,
         meta_c: float = 0.5, thr_min: float = 0.30, thr_max: float = 0.65,
@@ -738,6 +767,7 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
         all_metrics.append(m)
         joblib.dump(rf, os.path.join(out_dir, "rf_model.pkl"))
         print(f"  [Saved] rf_model.pkl")
+        _save_model_config(out_dir, feature_names, val_thr, "rf")
 
     if model_choice in ("stack", "both"):
         print(f"\n{'='*55}\n[2] STACKING (HGBT + GBT + RF)\n{'='*55}")
@@ -763,6 +793,7 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
         all_metrics.append(m)
         joblib.dump(stack, os.path.join(out_dir, "stacking_model.pkl"))
         print(f"  [Saved] stacking_model.pkl")
+        _save_model_config(out_dir, feature_names, val_thr, "stacking")
 
     print(f"\n{'═'*90}")
     print(f"  TỔNG KẾT — BLIND TEST")
@@ -789,7 +820,7 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Shadow — Column-Context Features")
-    parser.add_argument("--dataset",   default=r"C:\Users\ThinkPad\DATN1\Data\bongcan_processed\dataset.npz")
+    parser.add_argument("--dataset",   default=r"C:\Users\ThinkPad\Graduation_project\Data\bongcan_processed\dataset.npz")
     parser.add_argument("--model",     default="stack", choices=["rf", "stack", "both"])
     parser.add_argument("--test_size", default=0.2, type=float)
     parser.add_argument("--cv",        action="store_true", help="Bật 5-Fold CV")
