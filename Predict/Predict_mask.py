@@ -58,6 +58,30 @@ TE_LOW_PCT = 45
 RF_MIN_PROB = 0.25
 MAX_SHADOW_PCT = 0.15
 
+TUNED_MODEL_DEFAULTS = {
+    "rf": {
+        "threshold": 0.46,
+        "pp_mode": "vertical",
+        "pp_close_iter": 1,
+        "pp_min_area": 12,
+        "pp_min_height": 10,
+    },
+    "extratrees": {
+        "threshold": 0.45,
+        "pp_mode": "vertical",
+        "pp_close_iter": 2,
+        "pp_min_area": 6,
+        "pp_min_height": 4,
+    },
+    "stacking": {
+        "threshold": 0.89,
+        "pp_mode": "vertical",
+        "pp_close_iter": 2,
+        "pp_min_area": 12,
+        "pp_min_height": 12,
+    },
+}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG — đọc từ model_config.json (được Train.py lưu sau khi train)
@@ -96,7 +120,7 @@ _FALLBACK_FEATURES = {
 SELECTED_FEATURES: list = []
 
 
-def load_model_config(models_dir: str, model) -> dict:
+def load_model_config(models_dir: str, model, model_key: str = None) -> dict:
     """
     Đọc model_config.json từ thư mục models/ (được Train.py lưu sau train).
     Nếu không có → auto-detect từ n_features_in_ của model + _FALLBACK_FEATURES.
@@ -107,19 +131,24 @@ def load_model_config(models_dir: str, model) -> dict:
     """
     global SELECTED_FEATURES, ABSOLUTE_DARK_THRESHOLD, DERIVED_FEATURE_NAMES
 
-    config_path = os.path.join(models_dir, "model_config.json")
+    config_names = []
+    if model_key:
+        config_names.append(f"{model_key}_model_config.json")
+    config_names.append("model_config.json")
 
     # ── Ưu tiên 1: đọc từ model_config.json ──────────────────────
-    if os.path.exists(config_path):
-        with open(config_path, encoding="utf-8") as f:
-            cfg = json.load(f)
-        SELECTED_FEATURES       = cfg["selected_features"]
-        ABSOLUTE_DARK_THRESHOLD = cfg.get("absolute_dark_threshold", 0.38)
-        DERIVED_FEATURE_NAMES   = cfg.get("derived_feature_names", ["col_dark_score","absolute_dark"])
-        print(f"[config] Loaded model_config.json")
-        print(f"         features={cfg['n_features']}: {SELECTED_FEATURES}")
-        print(f"         threshold={cfg['val_threshold']}  |  dark_thr={ABSOLUTE_DARK_THRESHOLD}")
-        return cfg
+    for config_name in config_names:
+        config_path = os.path.join(models_dir, config_name)
+        if os.path.exists(config_path):
+            with open(config_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            SELECTED_FEATURES       = cfg["selected_features"]
+            ABSOLUTE_DARK_THRESHOLD = cfg.get("absolute_dark_threshold", 0.38)
+            DERIVED_FEATURE_NAMES   = cfg.get("derived_feature_names", ["col_dark_score","absolute_dark"])
+            print(f"[config] Loaded {config_name}")
+            print(f"         features={cfg['n_features']}: {SELECTED_FEATURES}")
+            print(f"         threshold={cfg['val_threshold']}  |  dark_thr={ABSOLUTE_DARK_THRESHOLD}")
+            return cfg
 
     # ── Ưu tiên 2: auto-detect từ n_features_in_ của model ───────
     n_feat = getattr(model, "n_features_in_", None)
@@ -237,20 +266,33 @@ def prepare_features_for_model(X_raw: np.ndarray, raw_feature_names: list,
     return X_sel
 
 
-def postprocess_patch_grid(pred_grid: np.ndarray, min_patch_area: int = 4) -> np.ndarray:
+def postprocess_patch_grid(pred_grid: np.ndarray, min_patch_area: int = 4,
+                           mode: str = "legacy", close_iter: int = None,
+                           min_patch_height: int = 1) -> np.ndarray:
     grid = pred_grid.astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    closed = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, kernel, iterations=2)
+    if mode == "vertical":
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        iterations = 1 if close_iter is None else close_iter
+    else:
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        iterations = 2 if close_iter is None else close_iter
+    closed = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, kernel, iterations=iterations)
     n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
     cleaned = np.zeros_like(closed, dtype=np.uint8)
     for idx in range(1, n_lab):
-        if stats[idx, cv2.CC_STAT_AREA] >= min_patch_area:
+        area = stats[idx, cv2.CC_STAT_AREA]
+        height = stats[idx, cv2.CC_STAT_HEIGHT]
+        if area >= min_patch_area and height >= min_patch_height:
             cleaned[labels == idx] = 1
     return cleaned
 
 
 def predict_grid_from_image(norm_img: np.ndarray, model, stem: str,
-                            threshold: float, apply_postprocess: bool) -> dict:
+                            threshold: float, apply_postprocess: bool,
+                            pp_mode: str = "legacy",
+                            pp_close_iter: int = None,
+                            pp_min_area: int = 4,
+                            pp_min_height: int = 1) -> dict:
     empty_mask = np.zeros(norm_img.shape, dtype=np.uint8)
     with contextlib.redirect_stdout(io.StringIO()):
         feats = compute_patch_features(norm_img, empty_mask, PATCH_H, PATCH_W, GLCM_BINS)
@@ -262,7 +304,16 @@ def predict_grid_from_image(norm_img: np.ndarray, model, stem: str,
     n_cols = norm_img.shape[1] // PATCH_W
     score_grid = scores.reshape(n_rows, n_cols)
     pred_raw = (score_grid >= threshold).astype(np.uint8)
-    pred_final = postprocess_patch_grid(pred_raw) if apply_postprocess else pred_raw
+    pred_final = (
+        postprocess_patch_grid(
+            pred_raw,
+            min_patch_area=pp_min_area,
+            mode=pp_mode,
+            close_iter=pp_close_iter,
+            min_patch_height=pp_min_height,
+        )
+        if apply_postprocess else pred_raw
+    )
     return {
         "score_grid": score_grid,
         "pred_raw": pred_raw,
@@ -426,6 +477,7 @@ def compute_overlap(gt, pred):
 
 def run_evaluate(
     data_dir        : str,
+    out_dir         : str   = None,
     thr_final       : float = None,
     n_theta         : int   = N_THETA,
     n_r             : int   = N_R_SAMPLES,
@@ -433,13 +485,21 @@ def run_evaluate(
     rf_min          : float = RF_MIN_PROB,
     max_shadow_frac : float = MAX_SHADOW_PCT,
     mask_patch_thr  : float = 0.30,
+    model_name      : str   = "auto",
+    tuned_defaults  : bool  = False,
+    pp_mode         : str   = None,
+    pp_close_iter   : int   = None,
+    pp_min_area     : int   = None,
+    pp_min_height   : int   = None,
+    save_outputs    : bool  = True,
     apply_postprocess: bool = True,
 ):
     data_dir    = os.path.abspath(data_dir)
     models_dir  = os.path.join(data_dir, "models")
-    out_dir     = os.path.join(data_dir, "eval_results")
+    out_dir     = os.path.abspath(out_dir) if out_dir else os.path.join(data_dir, "eval_results")
     overlay_dir = os.path.join(out_dir, "overlays")
-    os.makedirs(overlay_dir, exist_ok=True)
+    if save_outputs:
+        os.makedirs(overlay_dir, exist_ok=True)
 
     # ── 1. Load test split ─────────────────────────────────────────
     split_path = os.path.join(models_dir, "test_split_images.json")
@@ -451,15 +511,50 @@ def run_evaluate(
     print(f"\n[eval] {len(test_stems)} ảnh test từ test_split_images.json")
 
     # ── 2. Load model ──────────────────────────────────────────────
+    model_key = (model_name or "auto").lower()
+    model_candidates = {
+        "auto":          ["extratrees_model.pkl", "stacking_model.pkl", "rf_model.pkl"],
+        "extratrees":    ["extratrees_model.pkl"],
+        "extra":         ["extratrees_model.pkl"],
+        "et":            ["extratrees_model.pkl"],
+        "stacking":      ["stacking_model.pkl"],
+        "stack":         ["stacking_model.pkl"],
+        "rf":            ["rf_model.pkl"],
+        "random_forest": ["rf_model.pkl"],
+        "random-forest": ["rf_model.pkl"],
+    }
+    canonical_models = {
+        "auto": "auto",
+        "extratrees": "extratrees",
+        "extra": "extratrees",
+        "et": "extratrees",
+        "stacking": "stacking",
+        "stack": "stacking",
+        "rf": "rf",
+        "random_forest": "rf",
+        "random-forest": "rf",
+    }
+    canonical_model = canonical_models.get(model_key, model_key)
+    wanted_files = model_candidates.get(model_key)
+    if wanted_files is None:
+        print(f"[ERROR] --model khong hop le: {model_name}"); sys.exit(1)
+
     raw_model = None
-    for fname in ["stacking_model.pkl", "rf_model.pkl"]:
+    loaded_model_key = canonical_model
+    for fname in wanted_files:
         p = os.path.join(models_dir, fname)
         if os.path.exists(p):
             raw_model = joblib.load(p)
-            print(f"[eval] Model: {fname}")
+            if fname.startswith("extratrees"):
+                loaded_model_key = "extratrees"
+            elif fname.startswith("stacking"):
+                loaded_model_key = "stacking"
+            elif fname.startswith("rf"):
+                loaded_model_key = "rf"
+            print(f"[eval] Model: {fname} (--model {model_key})")
             break
     if raw_model is None:
-        print(f"[ERROR] Không tìm thấy .pkl trong {models_dir}"); sys.exit(1)
+        print(f"[ERROR] Khong tim thay model {', '.join(wanted_files)} trong {models_dir}"); sys.exit(1)
 
     # ── 3. Load feature names từ dataset.npz ──────────────────────
     npz_candidates = [
@@ -487,10 +582,26 @@ def run_evaluate(
     # ── [KEY] Load model_config.json để biết chính xác features cần dùng ──
     # Thứ tự bắt buộc: load model → load config → tạo wrapper
     # model_config.json được Train.py lưu sau mỗi lần train
-    cfg = load_model_config(models_dir, raw_model)
+    cfg = load_model_config(models_dir, raw_model, loaded_model_key)
     val_thr_from_train = float(cfg.get("val_threshold", 0.55))
-    if thr_final is None:
+    tuned = TUNED_MODEL_DEFAULTS.get(loaded_model_key, {})
+    if tuned_defaults and tuned:
+        if thr_final is None:
+            thr_final = tuned["threshold"]
+        if pp_mode is None:
+            pp_mode = tuned["pp_mode"]
+        if pp_close_iter is None:
+            pp_close_iter = tuned["pp_close_iter"]
+        if pp_min_area is None:
+            pp_min_area = tuned["pp_min_area"]
+        if pp_min_height is None:
+            pp_min_height = tuned["pp_min_height"]
+    elif thr_final is None:
         thr_final = val_thr_from_train
+
+    pp_mode = pp_mode or "legacy"
+    pp_min_area = 4 if pp_min_area is None else int(pp_min_area)
+    pp_min_height = 1 if pp_min_height is None else int(pp_min_height)
 
     print(f"\n[eval] Pipeline: Noise.py features ({len(RAW_FEATURE_NAMES)}) -> Train-derived -> model")
     print(f"       dataset schema co {len(raw_feature_names)} features")
@@ -498,6 +609,7 @@ def run_evaluate(
     print(f"       → select {len(SELECTED_FEATURES)} → model")
     print(f"  SELECTED ({len(SELECTED_FEATURES)}): {SELECTED_FEATURES}")
     print(f"  Threshold dang dung: {thr_final} (Train saved: {val_thr_from_train})")
+    print(f"  PP config: mode={pp_mode}, close_iter={pp_close_iter}, min_area={pp_min_area}, min_height={pp_min_height}")
 
     # ── 4. Tìm thư mục ảnh & mask ─────────────────────────────────
     img_dir = next(
@@ -543,7 +655,11 @@ def run_evaluate(
 
             norm = normalize(gray)
             res = predict_grid_from_image(
-                norm, raw_model, stem, thr_final, apply_postprocess)
+                norm, raw_model, stem, thr_final, apply_postprocess,
+                pp_mode=pp_mode,
+                pp_close_iter=pp_close_iter,
+                pp_min_area=pp_min_area,
+                pp_min_height=pp_min_height)
             pred_grid = (res["pred_final"] > 0).astype(np.uint8)
             pred_pixel_full = pred_grid_to_pixel(pred_grid, H, W)
 
@@ -562,8 +678,9 @@ def run_evaluate(
             print(f"    IoU={ovl['iou']:.3f} | Dice={ovl['dice']:.3f} | "
                   f"Recall={ovl['sensitivity']:.3f}")
 
-            ov_img = make_overlay_image(gray, gt_pixel, pred_pixel_full, ovl["iou"], stem)
-            cv2.imwrite(os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img)
+            if save_outputs:
+                ov_img = make_overlay_image(gray, gt_pixel, pred_pixel_full, ovl["iou"], stem)
+                cv2.imwrite(os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img)
 
             per_image.append({
                 "stem": stem, "img_path": img_path, "mask_path": mask_path,
@@ -609,14 +726,14 @@ def run_evaluate(
             bar = "█" * int(v * 20)
             print(f"  {k:<16} {v:>8.4f}  {bar}")
 
-    show_metrics("Pixel-level", m_px)
-    show_metrics("Patch-level", m_pa)
-
     if mean_ovl:
-        print(f"\n  Image-level (mean over {n_ok} ảnh):")
+        print(f"\n  Doctor-label Image-level (PRIMARY, mean over {n_ok} anh):")
         for k, v in mean_ovl.items():
-            bar = "█" * int(v * 20)
+            bar = "#" * int(v * 20)
             print(f"  {k:<16} {v:>8.4f}  {bar}")
+
+    show_metrics("Pixel-level (global, secondary)", m_px)
+    show_metrics("Patch-level (secondary)", m_pa)
 
     output = {
         "summary":       {"n_ok": n_ok, "n_skip": n_skip, "n_fail": n_fail},
@@ -625,12 +742,14 @@ def run_evaluate(
         "mean_overlap":  mean_ovl,
         "per_image":     per_image,
     }
-    with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    if save_outputs:
+        with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
 
-    print(f"\n{SEP}")
-    print(f"  Báo cáo → {out_dir}")
-    print(f"{SEP}")
+    if save_outputs:
+        print(f"\n{SEP}")
+        print(f"  Báo cáo → {out_dir}")
+        print(f"{SEP}")
     return output
 
 
@@ -641,8 +760,23 @@ def run_evaluate(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predict_mask — synced với Train.py 15-feature")
     parser.add_argument("--data_dir",       default=r"C:\Users\ThinkPad\Graduation_project\Data\bongcan_processed")
+    parser.add_argument("--out_dir",        default=None,
+                        help="Thu muc luu eval_results; mac dinh la data_dir/eval_results")
+    parser.add_argument("--no_save",        action="store_true",
+                        help="Chi in metrics, khong ghi overlay/json")
     parser.add_argument("--thr_final",      default=None,        type=float,
                         help="Threshold predict; mặc định dùng val_threshold trong model_config.json")
+    parser.add_argument("--model",          default="auto",
+                        choices=["auto", "extratrees", "extra", "et",
+                                 "stacking", "stack", "rf", "random_forest", "random-forest"],
+                        help="Chon model .pkl: auto uu tien extratrees, stacking, roi rf")
+    parser.add_argument("--tuned",          action="store_true",
+                        help="Dung threshold va vertical post-process da benchmark cho tung model")
+    parser.add_argument("--pp_mode",        default=None, choices=["legacy", "vertical"],
+                        help="Kieu post-process khi bat --pp/--tuned")
+    parser.add_argument("--pp_close_iter",  default=None, type=int)
+    parser.add_argument("--pp_min_area",    default=None, type=int)
+    parser.add_argument("--pp_min_height",  default=None, type=int)
     parser.add_argument("--n_theta",        default=N_THETA,     type=int)
     parser.add_argument("--n_r",            default=N_R_SAMPLES, type=int)
     parser.add_argument("--te_low_pct",     default=TE_LOW_PCT,  type=int)
@@ -654,17 +788,20 @@ if __name__ == "__main__":
     parser.add_argument("--no_pp",          action="store_true",
                         help="Giữ tương thích lệnh cũ; mặc định hiện đã tắt PP để lấy raw tốt nhất")
     args = parser.parse_args()
+    apply_pp = (args.pp or args.tuned) and not args.no_pp
 
     print("=" * 80)
     print("  PREDICT_MASK — SHADOW DETECTION (DATN)")
     print("  Features    : load from model_config.json")
-    print(f"  Threshold   : {args.thr_final if args.thr_final is not None else '[model_config]'}")
-    print(f"  Post-process: {'BẬT' if (args.pp and not args.no_pp) else 'TẮT'}")
+    print(f"  Model       : {args.model}")
+    print(f"  Threshold   : {args.thr_final if args.thr_final is not None else ('[tuned]' if args.tuned else '[model_config]')}")
+    print(f"  Post-process: {'BẬT' if apply_pp else 'TẮT'}")
     print("  Pipeline    : Noise.py feature extraction, no old geometric/ray pipeline")
     print("=" * 80 + "\n")
 
     run_evaluate(
         data_dir         = args.data_dir,
+        out_dir          = args.out_dir,
         thr_final        = args.thr_final,
         n_theta          = args.n_theta,
         n_r              = args.n_r,
@@ -672,5 +809,12 @@ if __name__ == "__main__":
         rf_min           = args.rf_min,
         max_shadow_frac  = args.max_shadow_pct / 100.0,
         mask_patch_thr   = args.mask_patch_thr,
-        apply_postprocess= args.pp and not args.no_pp,
+        model_name       = args.model,
+        tuned_defaults   = args.tuned,
+        pp_mode          = args.pp_mode,
+        pp_close_iter    = args.pp_close_iter,
+        pp_min_area      = args.pp_min_area,
+        pp_min_height    = args.pp_min_height,
+        save_outputs     = not args.no_save,
+        apply_postprocess= apply_pp,
     )

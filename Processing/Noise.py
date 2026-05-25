@@ -9,6 +9,7 @@ TARGET_LABEL     = "bc"
 PATCH_H          = 16
 PATCH_W          = 16
 GLCM_BINS        = 32
+MASK_PATCH_THR   = 0.30
 
 # 12 đặc trưng cơ bản + 3 đặc trưng ngữ cảnh cột (column-context)
 FEATURE_NAMES = [
@@ -145,7 +146,8 @@ def _build_glcm(patch_q, bins):
     return glcm
 
 
-def compute_patch_features(norm_img, mask, patch_h, patch_w, bins):
+def compute_patch_features(norm_img, mask, patch_h, patch_w, bins,
+                           mask_patch_thr=MASK_PATCH_THR):
     # ĐÃ XÓA parameter fan_mask
     H, W   = norm_img.shape
     n_rows = H // patch_h
@@ -180,7 +182,7 @@ def compute_patch_features(norm_img, mask, patch_h, patch_w, bins):
 
             cov = float(pm.sum()) / (255.0 * pm.size)
             coverage_p[r, c] = cov
-            label_p[r, c]    = 1 if cov > 0 else 0
+            label_p[r, c]    = 1 if cov >= mask_patch_thr else 0
             if cov > 0: n_sh_total += 1
 
             g = _build_glcm(pq, bins)
@@ -269,7 +271,8 @@ def compute_patch_features(norm_img, mask, patch_h, patch_w, bins):
 # MAIN PIPELINE 
 # ═══════════════════════════════════════════════════════════════════
 
-def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
+def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W,
+        mask_patch_thr=MASK_PATCH_THR, debug=False):
 
     img_dir     = os.path.join(output_root, "images_gray")
     feat_dir    = os.path.join(output_root, "feature_maps")
@@ -287,7 +290,7 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
     print(f"  {len(json_files)} file  patch={patch_h}×{patch_w}  bins={GLCM_BINS}")
     print(f"  Features: {len(FEATURE_NAMES)} (Base Features)")
     print(f"  crop_fan : ĐÃ LOẠI BỎ (Dùng ảnh kích thước gốc 100%)")
-    print(f"  Label rule: coverage > 0")
+    print(f"  Label rule: coverage >= {mask_patch_thr:.2f}")
     print(f"{'─'*65}")
 
     ok = 0; skip = 0
@@ -376,7 +379,7 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
                 continue
 
             print(f"  → {stem}  ({W_img}×{H_img}) {bc_count} poly:")
-            feats = compute_patch_features(norm_img, mask, patch_h, patch_w, GLCM_BINS)
+            feats = compute_patch_features(norm_img, mask, patch_h, patch_w, GLCM_BINS, mask_patch_thr)
 
             all_features.append(feats["patch_features"])
             all_labels.append(feats["patch_labels"])
@@ -430,7 +433,16 @@ def run(data_root, output_root, patch_h=PATCH_H, patch_w=PATCH_W, debug=False):
     COV = np.concatenate(all_coverage).astype(np.float32)
 
     dataset_path = os.path.join(output_root, "dataset.npz")
-    np.savez(dataset_path, X=X, Y=Y, coverage=COV, stems=np.array(all_stems), feature_names=np.array(FEATURE_NAMES))
+    np.savez(
+        dataset_path,
+        X=X,
+        Y=Y,
+        Y_soft=COV,
+        coverage=COV,
+        stems=np.array(all_stems),
+        feature_names=np.array(FEATURE_NAMES),
+        mask_patch_thr=np.float32(mask_patch_thr),
+    )
 
     n_pos = int(Y.sum()); n_neg = len(Y) - n_pos
     ratio = n_neg / max(n_pos, 1)
@@ -449,7 +461,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", default=r"C:\Users\ThinkPad\Graduation project\Data\bongcan_processed")
     parser.add_argument("--patch_h", default=PATCH_H, type=int)
     parser.add_argument("--patch_w", default=PATCH_W, type=int)
+    parser.add_argument("--mask_patch_thr", default=MASK_PATCH_THR, type=float)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    run(args.data, args.output, args.patch_h, args.patch_w, args.debug)
+    run(args.data, args.output, args.patch_h, args.patch_w, args.mask_patch_thr, args.debug)

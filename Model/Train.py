@@ -17,6 +17,13 @@ CHANGELOG so với phiên bản cũ:
 
 import os, sys
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 if os.name == "nt":
     os.environ["LOKY_MAX_CPU_COUNT"]  = "14"
     os.environ["JOBLIB_BACKEND"]      = "threading"
@@ -26,9 +33,12 @@ if os.name == "nt":
 import json, argparse, time, warnings
 import numpy as np
 from pathlib import Path
+from PIL import Image
+import cv2
 
 from sklearn.ensemble import (
     RandomForestClassifier,
+    ExtraTreesClassifier,
     GradientBoostingClassifier,
     HistGradientBoostingClassifier,
     StackingClassifier,
@@ -246,7 +256,7 @@ def select_features(X: np.ndarray, feature_names: list,
     return X[:, idx].astype(X.dtype, copy=False), list(selected)
 
 
-def load_dataset(npz_path: str):
+def load_dataset(npz_path: str, mask_patch_thr: float = 0.30):
     """
     [BUG FIX] Thứ tự ưu tiên khi load Y_soft:
       1. Key "Y_soft" trong file (nếu Noise.py mới đã lưu)
@@ -258,7 +268,7 @@ def load_dataset(npz_path: str):
     """
     d = np.load(npz_path, allow_pickle=True)
     X = d["X"].astype(np.float32)
-    Y = d["Y"].astype(np.int32)
+    Y_saved = d["Y"].astype(np.int32)
     stems         = d["stems"] if "stems" in d else np.array([str(i) for i in range(len(Y))])
     feature_names = [str(s) for s in d["feature_names"]]
 
@@ -270,8 +280,16 @@ def load_dataset(npz_path: str):
         Y_soft = d["coverage"].astype(np.float32)
         print("  [Y_soft] Fallback to 'coverage' key (chạy lại Noise.py để lưu Y_soft đúng cách)")
     else:
-        Y_soft = Y.astype(np.float32)
+        Y_soft = Y_saved.astype(np.float32)
         print("  [Y_soft] WARNING: Fallback to binary Y — FHL weights mất tác dụng!")
+
+    if "coverage" in d or "Y_soft" in d:
+        Y = (Y_soft >= mask_patch_thr).astype(np.int32)
+        changed = int((Y != Y_saved).sum())
+        print(f"  [LabelSync] Y = coverage >= {mask_patch_thr:.2f} | changed={changed:,}/{len(Y):,}")
+    else:
+        Y = Y_saved
+        print("  [LabelSync] Không có coverage/Y_soft; giữ Y đã lưu trong dataset")
 
     if np.isnan(X).sum() + np.isinf(X).sum() > 0:
         X = np.nan_to_num(X, nan=0., posinf=1., neginf=-1.)
@@ -334,6 +352,24 @@ def build_rf(ratio=None):
     )
 
 
+def build_extra_trees(ratio=None):
+    """
+    ExtraTrees balanced_subsample cho bài toán mask bóng cản.
+    Benchmark trên tập Predict hiện tại tốt hơn RF/Stacking vì giảm variance
+    nhưng vẫn giữ recall tốt ở vùng bóng kéo dài.
+    """
+    return ExtraTreesClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        bootstrap=False,
+        n_jobs=N_JOBS_RF,
+        random_state=42,
+    )
+
+
 def build_stacking(ratio, meta_c=0.5):
     """
     Stacking 3 base learners với meta Logistic Regression:
@@ -352,7 +388,7 @@ def build_stacking(ratio, meta_c=0.5):
           C=0.5 (L2 regularization vừa phải, tránh overfit meta level)
     """
     hgbt = HistGradientBoostingClassifier(
-        max_iter=500,
+        max_iter=300,
         max_leaf_nodes=31,
         learning_rate=0.03,
         min_samples_leaf=15,
@@ -386,9 +422,9 @@ def build_stacking(ratio, meta_c=0.5):
     stacking = StackingClassifier(
         estimators=[("hgbt", hgbt), ("gbt", gbt), ("rf", rf)],
         final_estimator=meta_lr,
-        cv=5,
+        cv=3,
         passthrough=True,   # meta learner nhận thêm raw features
-        n_jobs=1,
+        n_jobs=-1,
     )
     return Pipeline([("scaler", StandardScaler()), ("classifier", stacking)])
 
@@ -497,7 +533,7 @@ def cross_validate_and_find_threshold(
 
         sw = compute_fhl_weights(ys_tr_, y_tr_) if use_fhl else None
 
-        m = (model_builder(ratio) if model_builder.__name__ == "build_rf"
+        m = (model_builder(ratio) if model_builder.__name__ in ("build_rf", "build_extra_trees")
              else model_builder(ratio, meta_c=meta_c))
         fit_with_weight(m, X_tr_, y_tr_, sw)
 
@@ -685,6 +721,170 @@ def evaluate_on_test(name, model, X_te, y_te, stems_te, feature_names,
     }
 
 
+def _import_predict_mask():
+    project_root = Path(__file__).resolve().parents[1]
+    predict_dir = project_root / "Predict"
+    processing_dir = project_root / "Processing"
+    for p in (str(predict_dir), str(processing_dir)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import Predict_mask as pm
+    return pm
+
+
+def _counts_from_masks(gt, pred):
+    tp = int(((pred == 1) & (gt == 1)).sum())
+    fp = int(((pred == 1) & (gt == 0)).sum())
+    fn = int(((pred == 0) & (gt == 1)).sum())
+    tn = int(((pred == 0) & (gt == 0)).sum())
+    return tp, fp, fn, tn
+
+
+def _metrics_from_counts(tp, fp, fn, tn):
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    accuracy = (tp + tn) / max(tp + fp + fn + tn, 1)
+    iou = tp / max(tp + fp + fn, 1)
+    dice = 2 * tp / max(2 * tp + fp + fn, 1)
+    return {
+        "accuracy": round(float(accuracy), 4),
+        "precision": round(float(precision), 4),
+        "recall": round(float(recall), 4),
+        "specificity": round(float(specificity), 4),
+        "iou": round(float(iou), 4),
+        "dice": round(float(dice), 4),
+        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+    }
+
+
+def _overlap_from_counts(tp, fp, fn):
+    iou = tp / max(tp + fp + fn, 1)
+    dice = 2 * tp / max(2 * tp + fp + fn, 1)
+    sensitivity = tp / max(tp + fn, 1)
+    precision = tp / max(tp + fp, 1)
+    return {
+        "iou": iou,
+        "dice": dice,
+        "sensitivity": sensitivity,
+        "precision": precision,
+    }
+
+
+def evaluate_predict_pipeline_on_test(name, model, data_dir, test_bases,
+                                      feature_names, val_threshold,
+                                      model_type, apply_postprocess=True):
+    """
+    Đánh giá đúng như Predict_mask.py: recompute feature từ ảnh, dựng grid predict
+    về pixel mask, rồi so với mask polygon thật. Đây là metric cần báo cáo.
+    """
+    pm = _import_predict_mask()
+    pm.SELECTED_FEATURES = list(feature_names)
+    pm.ABSOLUTE_DARK_THRESHOLD = ABSOLUTE_DARK_THRESHOLD
+    pm.DERIVED_FEATURE_NAMES = list(DERIVED_FEATURE_NAMES)
+
+    img_dir = next(
+        (os.path.join(data_dir, d) for d in ["images_gray", "images", "imgs", "bongcan"]
+         if os.path.isdir(os.path.join(data_dir, d))), None
+    )
+    mask_dir = next(
+        (os.path.join(data_dir, d) for d in ["masks", "mask", "labels", "annotations", "ground_truth"]
+         if os.path.isdir(os.path.join(data_dir, d))), None
+    )
+    if img_dir is None or mask_dir is None:
+        print("  [PredictEval] Bỏ qua: không tìm thấy thư mục ảnh/mask")
+        return {}
+
+    tuned = pm.TUNED_MODEL_DEFAULTS.get(model_type, {})
+    pp_mode = tuned.get("pp_mode", "legacy")
+    pp_close_iter = tuned.get("pp_close_iter")
+    pp_min_area = tuned.get("pp_min_area", 4)
+    pp_min_height = tuned.get("pp_min_height", 1)
+
+    totals_raw = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    totals_final = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    per_raw = []
+    per_final = []
+    n_ok = n_skip = 0
+
+    for stem in sorted(test_bases):
+        img_path = pm.find_file(img_dir, stem)
+        mask_path = pm.find_file(mask_dir, stem)
+        if img_path is None or mask_path is None:
+            n_skip += 1
+            continue
+
+        img_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+        gray = cv2.medianBlur(cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY), ksize=3)
+        h, w = gray.shape
+        gt_pixel = pm.load_mask_binary(mask_path, h, w)
+
+        res = pm.predict_grid_from_image(
+            pm.normalize(gray), model, stem, val_threshold, False)
+        pred_raw_grid = (res["pred_raw"] > 0).astype(np.uint8)
+        pred_final_grid = (
+            pm.postprocess_patch_grid(
+                pred_raw_grid,
+                min_patch_area=pp_min_area,
+                mode=pp_mode,
+                close_iter=pp_close_iter,
+                min_patch_height=pp_min_height,
+            )
+            if apply_postprocess else pred_raw_grid
+        )
+
+        pred_raw_pixel = pm.pred_grid_to_pixel(pred_raw_grid, h, w)
+        pred_final_pixel = pm.pred_grid_to_pixel(pred_final_grid, h, w)
+
+        tp, fp, fn, tn = _counts_from_masks(gt_pixel, pred_raw_pixel)
+        totals_raw["tp"] += tp; totals_raw["fp"] += fp
+        totals_raw["fn"] += fn; totals_raw["tn"] += tn
+        per_raw.append(_overlap_from_counts(tp, fp, fn))
+
+        tp, fp, fn, tn = _counts_from_masks(gt_pixel, pred_final_pixel)
+        totals_final["tp"] += tp; totals_final["fp"] += fp
+        totals_final["fn"] += fn; totals_final["tn"] += tn
+        per_final.append(_overlap_from_counts(tp, fp, fn))
+        n_ok += 1
+
+    if n_ok == 0:
+        print("  [PredictEval] Không có ảnh hợp lệ để đánh giá")
+        return {}
+
+    px_raw = _metrics_from_counts(**totals_raw)
+    px_final = _metrics_from_counts(**totals_final)
+    mean_raw = {
+        k: round(float(np.mean([r[k] for r in per_raw])), 4)
+        for k in ["iou", "dice", "sensitivity", "precision"]
+    }
+    mean_final = {
+        k: round(float(np.mean([r[k] for r in per_final])), 4)
+        for k in ["iou", "dice", "sensitivity", "precision"]
+    }
+
+    print(f"\n{'═'*70}")
+    print(f"  [{name}] — PREDICT-PIPELINE PIXEL EVAL")
+    print(f"{'═'*70}")
+    print(f"  images={n_ok} skip={n_skip} | thr={val_threshold:.4f}")
+    print(f"  PP={apply_postprocess} mode={pp_mode} close={pp_close_iter} "
+          f"area={pp_min_area} height={pp_min_height}")
+    print(f"  Pixel raw  : IoU={px_raw['iou']:.4f} Dice={px_raw['dice']:.4f} "
+          f"Prec={px_raw['precision']:.4f} Rec={px_raw['recall']:.4f}")
+    print(f"  Pixel final: IoU={px_final['iou']:.4f} Dice={px_final['dice']:.4f} "
+          f"Prec={px_final['precision']:.4f} Rec={px_final['recall']:.4f}")
+    print(f"  Mean image : IoU={mean_final['iou']:.4f} Dice={mean_final['dice']:.4f} "
+          f"Prec={mean_final['precision']:.4f} Rec={mean_final['sensitivity']:.4f}")
+
+    return {
+        "predict_pixel_raw": px_raw,
+        "predict_pixel_final": px_final,
+        "predict_mean_raw": mean_raw,
+        "predict_mean_final": mean_final,
+        "predict_n_images": n_ok,
+        "predict_n_skip": n_skip,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════
 # MAIN RUN
 # ═══════════════════════════════════════════════════════════════════
@@ -712,21 +912,26 @@ def _save_model_config(out_dir: str, feature_names: list, threshold: float, mode
         "model_type":              model_type,
         "col_context_features":    ["above_max_mean", "col_dark_ratio", "mean_drop"],
     }
-    path = os.path.join(out_dir, "model_config.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-    print(f"  [Saved] model_config.json → {path}")
+    paths = [
+        os.path.join(out_dir, "model_config.json"),
+        os.path.join(out_dir, f"{model_type}_model_config.json"),
+    ]
+    for path in paths:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"  [Saved] model_config.json + {model_type}_model_config.json")
     print(f"          features={len(feature_names)}: {feature_names}")
 
 def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
         do_cv: bool = False, use_fhl: bool = True, manual_thr: float = 0.55,
-        meta_c: float = 0.5, thr_min: float = 0.30, thr_max: float = 0.65,
-        apply_postprocess: bool = True):
+        meta_c: float = 0.5, thr_min: float = 0.05, thr_max: float = 0.95,
+        mask_patch_thr: float = 0.30, apply_postprocess: bool = True):
 
     out_dir = str(Path(dataset_path).parent / "models")
+    data_dir = str(Path(dataset_path).parent)
     os.makedirs(out_dir, exist_ok=True)
 
-    X, Y, Y_soft, feature_names, ratio, stems = load_dataset(dataset_path)
+    X, Y, Y_soft, feature_names, ratio, stems = load_dataset(dataset_path, mask_patch_thr)
 
     train_mask, test_mask, test_bases = image_level_split(stems, test_ratio=test_size)
     X_tr, y_tr           = X[train_mask], Y[train_mask]
@@ -744,7 +949,34 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
 
     all_metrics = []
 
-    if model_choice in ("rf", "both"):
+    if model_choice in ("extra", "et", "extratrees", "all"):
+        print(f"\n{'='*55}\n[0] EXTRA TREES\n{'='*55}")
+        val_thr = manual_thr
+        if do_cv:
+            val_thr = cross_validate_and_find_threshold(
+                build_extra_trees, X_tr, y_tr, ys_tr, stems_tr, ratio,
+                use_fhl=False, thr_min=thr_min, thr_max=thr_max,
+            )
+        else:
+            print(f"[Config] CV=TẮT. Threshold cố định = {val_thr:.4f}")
+
+        print(f"\n[Final Train ExtraTrees] {len(X_tr):,} mẫu ...")
+        et = build_extra_trees(ratio)
+        # ExtraTrees dùng class_weight='balanced_subsample'; không dùng FHL sample_weight
+        # để tránh over-compensate lớp bóng.
+        fit_with_weight(et, X_tr, y_tr, None)
+
+        m = evaluate_on_test("Extra Trees", et, X_te, y_te, stems_te,
+                             feature_names, val_thr, out_dir, False)
+        m.update(evaluate_predict_pipeline_on_test(
+            "Extra Trees", et, data_dir, test_bases, feature_names,
+            val_thr, "extratrees", apply_postprocess))
+        all_metrics.append(m)
+        joblib.dump(et, os.path.join(out_dir, "extratrees_model.pkl"), compress=3)
+        print(f"  [Saved] extratrees_model.pkl")
+        _save_model_config(out_dir, feature_names, val_thr, "extratrees")
+
+    if model_choice in ("rf", "both", "all"):
         print(f"\n{'='*55}\n[1] RANDOM FOREST\n{'='*55}")
         val_thr = manual_thr
         if do_cv:
@@ -763,13 +995,16 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
             print(f"  OOB Score = {rf.oob_score_:.4f}")
 
         m = evaluate_on_test("Random Forest", rf, X_te, y_te, stems_te,
-                             feature_names, val_thr, out_dir, apply_postprocess)
+                             feature_names, val_thr, out_dir, False)
+        m.update(evaluate_predict_pipeline_on_test(
+            "Random Forest", rf, data_dir, test_bases, feature_names,
+            val_thr, "rf", apply_postprocess))
         all_metrics.append(m)
         joblib.dump(rf, os.path.join(out_dir, "rf_model.pkl"))
         print(f"  [Saved] rf_model.pkl")
         _save_model_config(out_dir, feature_names, val_thr, "rf")
 
-    if model_choice in ("stack", "both"):
+    if model_choice in ("stack", "both", "all"):
         print(f"\n{'='*55}\n[2] STACKING (HGBT + GBT + RF)\n{'='*55}")
         print(f"[Config] Meta-LR C={meta_c} | passthrough=True")
         val_thr = manual_thr
@@ -789,7 +1024,10 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
         print(f"  Hoàn tất ({time.time()-t0:.1f}s)")
 
         m = evaluate_on_test("Stacking Ensemble", stack, X_te, y_te, stems_te,
-                             feature_names, val_thr, out_dir, apply_postprocess)
+                             feature_names, val_thr, out_dir, False)
+        m.update(evaluate_predict_pipeline_on_test(
+            "Stacking Ensemble", stack, data_dir, test_bases, feature_names,
+            val_thr, "stacking", apply_postprocess))
         all_metrics.append(m)
         joblib.dump(stack, os.path.join(out_dir, "stacking_model.pkl"))
         print(f"  [Saved] stacking_model.pkl")
@@ -798,15 +1036,17 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
     print(f"\n{'═'*90}")
     print(f"  TỔNG KẾT — BLIND TEST")
     print(f"{'═'*90}")
-    header = (f"  {'Model':<22} {'Thr':>6} {'IoU(raw)':>10} "
-              f"{'Dice(raw)':>11} {'IoU(PP)':>9} {'Dice(PP)':>10} {'F1':>8}")
+    header = (f"  {'Model':<22} {'Thr':>6} {'PatchRawIoU':>11} {'PatchRawDice':>12} "
+              f"{'PredPixIoU':>10} {'PredPixDice':>11} {'PredMeanIoU':>11}")
     print(header)
-    print(f"  {'─'*88}")
+    print(f"  {'─'*92}")
     for m in all_metrics:
+        pred_px = m.get("predict_pixel_final", {})
+        pred_mean = m.get("predict_mean_final", {})
         print(f"  {m['model']:<22} {m['val_threshold']:>6.3f} "
-              f"{m['test_iou_raw']:>10.4f} {m['test_dice_raw']:>11.4f} "
-              f"{m['test_iou_image']:>9.4f} {m['test_dice_image']:>10.4f} "
-              f"{m['f1']:>8.4f}")
+              f"{m['test_iou_raw']:>11.4f} {m['test_dice_raw']:>12.4f} "
+              f"{pred_px.get('iou', 0):>10.4f} {pred_px.get('dice', 0):>11.4f} "
+              f"{pred_mean.get('iou', 0):>11.4f}")
     print(f"{'═'*90}")
 
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
@@ -821,12 +1061,15 @@ def run(dataset_path: str, model_choice: str = "stack", test_size: float = 0.2,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Shadow — Column-Context Features")
     parser.add_argument("--dataset",   default=r"C:\Users\ThinkPad\Graduation_project\Data\bongcan_processed\dataset.npz")
-    parser.add_argument("--model",     default="stack", choices=["rf", "stack", "both"])
+    parser.add_argument("--model",     default="stack",
+                        choices=["rf", "stack", "extra", "et", "extratrees", "both", "all"])
     parser.add_argument("--test_size", default=0.2, type=float)
     parser.add_argument("--cv",        action="store_true", help="Bật 5-Fold CV")
     parser.add_argument("--thr",       default=0.55, type=float)
-    parser.add_argument("--thr_min",   default=0.30, type=float)
-    parser.add_argument("--thr_max",   default=0.65, type=float)
+    parser.add_argument("--thr_min",   default=0.05, type=float)
+    parser.add_argument("--thr_max",   default=0.95, type=float)
+    parser.add_argument("--mask_patch_thr", default=0.30, type=float,
+                        help="Hard label threshold: Y = coverage >= mask_patch_thr")
     parser.add_argument("--meta_c",    default=0.5,  type=float)
     parser.add_argument("--no_fhl",    action="store_true")
     parser.add_argument("--no_pp",     action="store_true")
@@ -844,6 +1087,7 @@ if __name__ == "__main__":
         print(f"    {tag:<12} {f}")
     print(f"  CV       : {'BẬT' if args.cv else 'TẮT'} | "
           f"Thr={'[auto]' if args.cv else args.thr}")
+    print(f"  Label    : coverage >= {args.mask_patch_thr:.2f}")
     print(f"  FHL      : {'TẮT' if args.no_fhl else 'BẬT (cần Y_soft = coverage)'}")
     print("=" * 80 + "\n")
 
@@ -857,5 +1101,6 @@ if __name__ == "__main__":
         meta_c            = args.meta_c,
         thr_min           = args.thr_min,
         thr_max           = args.thr_max,
+        mask_patch_thr    = args.mask_patch_thr,
         apply_postprocess = not args.no_pp,
     )
