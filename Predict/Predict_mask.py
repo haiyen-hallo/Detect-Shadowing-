@@ -18,6 +18,7 @@ import warnings
 import traceback
 import contextlib
 import io
+import time
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -366,6 +367,301 @@ def pred_grid_to_pixel(pred_grid: np.ndarray, H: int, W: int) -> np.ndarray:
     return pixel
 
 
+def _odd_kernel_size(value: int, minimum: int = 3) -> int:
+    value = max(minimum, int(round(value)))
+    return value if value % 2 == 1 else value + 1
+
+
+def _fill_external_contours(mask: np.ndarray) -> np.ndarray:
+    contours, _ = cv2.findContours((mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(mask, dtype=np.uint8)
+    if contours:
+        cv2.drawContours(filled, contours, -1, 1, thickness=-1)
+    return filled
+
+
+def _count_components(mask: np.ndarray) -> int:
+    n_lab, _, _, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    return max(0, n_lab - 1)
+
+
+def _chaikin_smooth_contour(contour: np.ndarray, iterations: int = 3) -> np.ndarray:
+    pts = contour.reshape(-1, 2).astype(np.float32)
+    if len(pts) < 3:
+        return contour
+
+    for _ in range(max(0, int(iterations))):
+        new_pts = []
+        for i in range(len(pts)):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % len(pts)]
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            new_pts.extend([q, r])
+        pts = np.asarray(new_pts, dtype=np.float32)
+
+    pts = np.round(pts).astype(np.int32)
+    return pts.reshape(-1, 1, 2)
+
+
+def _smooth_tight_contour(contour: np.ndarray, smooth_eps: float, smooth_iter: int) -> np.ndarray:
+    peri = cv2.arcLength(contour, True)
+    eps = max(1.0, smooth_eps * peri)
+    approx = cv2.approxPolyDP(contour, eps, True)
+    return _chaikin_smooth_contour(approx, iterations=smooth_iter)
+
+
+def _smooth_1d(values: np.ndarray, win: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    win = max(1, int(win))
+    if win <= 1 or values.size < 3:
+        return values
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    kernel = np.ones(win, dtype=np.float32) / win
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _seed_profile_envelope(seed_mask: np.ndarray, margin_x: int) -> np.ndarray:
+    H, W = seed_mask.shape
+    rows = np.where(seed_mask.any(axis=1))[0]
+    if rows.size == 0:
+        return np.zeros_like(seed_mask, dtype=np.uint8)
+
+    left = np.zeros(rows.size, dtype=np.float32)
+    right = np.zeros(rows.size, dtype=np.float32)
+    for i, y in enumerate(rows):
+        xs = np.where(seed_mask[y] > 0)[0]
+        left[i] = float(xs.min())
+        right[i] = float(xs.max())
+
+    y_full = np.arange(int(rows[0]), int(rows[-1]) + 1)
+    left_i = np.interp(y_full, rows, left)
+    right_i = np.interp(y_full, rows, right)
+    smooth_win = max(3, min(PATCH_H * 2 + 1, len(y_full) // 5 * 2 + 1))
+    left_i = _smooth_1d(left_i, smooth_win)
+    right_i = _smooth_1d(right_i, smooth_win)
+
+    env = np.zeros_like(seed_mask, dtype=np.uint8)
+    for j, y in enumerate(y_full):
+        x0 = int(max(0, np.floor(left_i[j] - margin_x)))
+        x1 = int(min(W - 1, np.ceil(right_i[j] + margin_x)))
+        if x1 >= x0:
+            env[y, x0:x1 + 1] = 1
+    return env
+
+
+def _trim_bottom_collapse(mask: np.ndarray) -> np.ndarray:
+    mask = (mask > 0).astype(np.uint8)
+    rows = np.where(mask.any(axis=1))[0]
+    if rows.size < PATCH_H * 3:
+        return mask
+
+    widths = []
+    for y in rows:
+        xs = np.where(mask[y] > 0)[0]
+        widths.append(xs.max() - xs.min() + 1)
+    widths = _smooth_1d(np.asarray(widths, dtype=np.float32), max(5, PATCH_H | 1))
+
+    peak_i = int(np.argmax(widths))
+    peak_w = float(widths[peak_i])
+    if peak_w < PATCH_W * 2:
+        return mask
+
+    collapse_thr = max(PATCH_W * 1.5, peak_w * 0.45)
+    run_need = max(PATCH_H, rows.size // 12)
+    run = 0
+    cut_i = None
+    for i in range(peak_i + PATCH_H, rows.size):
+        if widths[i] < collapse_thr:
+            run += 1
+            if run >= run_need:
+                cut_i = i - run + 1
+                break
+        else:
+            run = 0
+
+    if cut_i is None:
+        return mask
+
+    trimmed = mask.copy()
+    trimmed[rows[cut_i]:, :] = 0
+    return trimmed
+
+
+def _apply_vertical_growth_prior(mask: np.ndarray, growth_per_row: float = 0.55) -> np.ndarray:
+    mask = (mask > 0).astype(np.uint8)
+    rows = np.where(mask.any(axis=1))[0]
+    if rows.size < PATCH_H * 2:
+        return mask
+
+    extents = []
+    for y in rows:
+        xs = np.where(mask[y] > 0)[0]
+        extents.append((float(xs.min()), float(xs.max())))
+
+    init_n = max(1, min(PATCH_H, len(extents)))
+    prev_l = float(np.median([e[0] for e in extents[:init_n]]))
+    prev_r = float(np.median([e[1] for e in extents[:init_n]]))
+
+    out = np.zeros_like(mask, dtype=np.uint8)
+    skipped = 0
+    for y, (left, right) in zip(rows, extents):
+        allowed_l = prev_l - growth_per_row
+        allowed_r = prev_r + growth_per_row
+        x0 = int(max(left, np.floor(allowed_l)))
+        x1 = int(min(right, np.ceil(allowed_r)))
+
+        if x1 < x0:
+            skipped += 1
+            if skipped > PATCH_H:
+                break
+            continue
+
+        out[y, x0:x1 + 1] = 1
+        prev_l = 0.85 * prev_l + 0.15 * x0
+        prev_r = 0.85 * prev_r + 0.15 * x1
+        skipped = 0
+
+    if out.sum() < max(300, mask.sum() * 0.20):
+        return mask
+    return out
+
+
+def _shadow_shape_score(mask: np.ndarray, seed_area: int) -> float:
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return 0.0
+    height = float(ys.max() - ys.min() + 1)
+    width = float(xs.max() - xs.min() + 1)
+    aspect = height / max(width, 1.0)
+
+    rows = np.where(mask.any(axis=1))[0]
+    row_widths = []
+    for y in rows:
+        xrow = np.where(mask[y] > 0)[0]
+        row_widths.append(xrow.max() - xrow.min() + 1)
+    row_widths = _smooth_1d(np.asarray(row_widths, dtype=np.float32), max(5, PATCH_H | 1))
+    n = len(row_widths)
+    top_w = float(np.median(row_widths[:max(1, n // 4)]))
+    lower_w = float(np.median(row_widths[max(1, n // 2):]))
+    expand_bonus = min(1.5, lower_w / max(top_w, 1.0))
+    if lower_w < top_w * 0.55:
+        expand_bonus *= 0.35
+
+    return seed_area * (0.7 + min(aspect, 4.0) * 0.25) * expand_bonus
+
+
+def doctor_contour_postprocess(
+    pred_mask: np.ndarray,
+    min_area_px: int = 700,
+    min_height_px: int = 32,
+    min_aspect_hw: float = 0.35,
+    max_components: int = 4,
+    close_px: int = 55,
+    open_px: int = 3,
+    smooth_eps: float = 0.004,
+    smooth_iter: int = 3,
+    shape_mode: str = "balanced",
+) -> np.ndarray:
+    """
+    Clean blocky/ragged prediction into doctor-style filled contours.
+    balanced: vertical closing + island filtering, best IoU.
+    light   : also constrain to the seed profile and trim lower collapse.
+    strict  : additionally limits side growth row by row; use only for review.
+    """
+    seed = (pred_mask > 0).astype(np.uint8)
+    if seed.sum() == 0:
+        return seed
+
+    shape_mode = (shape_mode or "balanced").lower()
+    H, W = seed.shape
+    close_y = _odd_kernel_size(close_px)
+    close_x = _odd_kernel_size(min(PATCH_W + 3, max(5, close_px // 3)))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_x, close_y))
+
+    # Bridge gaps vertically without making a large horizontal envelope.
+    grouped = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
+    grouped = _fill_external_contours(grouped)
+
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
+    candidates = []
+    min_seed_area = max(2 * PATCH_H * PATCH_W, min_area_px // 2)
+    for idx in range(1, n_lab):
+        group = (labels == idx).astype(np.uint8)
+        seed_in_group = (seed & group).astype(np.uint8)
+        seed_area = int(seed_in_group.sum())
+        if seed_area < min_seed_area:
+            continue
+
+        local = cv2.morphologyEx(seed_in_group, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
+        local = _fill_external_contours(local)
+        if _count_components(local) > 1:
+            local = cv2.morphologyEx(group, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
+            local = _fill_external_contours(local)
+
+        if shape_mode in {"light", "strict"}:
+            env = _seed_profile_envelope(seed_in_group, margin_x=max(2, PATCH_W // 4))
+            local = (local & env).astype(np.uint8)
+            local = (_fill_external_contours(local) & env).astype(np.uint8)
+            if shape_mode == "strict":
+                local = _apply_vertical_growth_prior(local)
+                local = (_fill_external_contours(local) & env).astype(np.uint8)
+            local = _trim_bottom_collapse(local)
+        else:
+            env = None
+
+        if open_px and open_px > 1:
+            open_k = _odd_kernel_size(open_px)
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+            local = cv2.morphologyEx(local, cv2.MORPH_OPEN, k, iterations=1)
+            local = _fill_external_contours(local)
+            if env is not None:
+                local = (local & env).astype(np.uint8)
+
+        ys, xs = np.where(local > 0)
+        if ys.size == 0:
+            continue
+        area = int(ys.size)
+        width = int(xs.max() - xs.min() + 1)
+        height = int(ys.max() - ys.min() + 1)
+        aspect_hw = height / max(width, 1)
+        if area < min_area_px or height < min_height_px or aspect_hw < min_aspect_hw:
+            continue
+
+        score = _shadow_shape_score(local, seed_area)
+        candidates.append((score, local))
+
+    if not candidates:
+        return np.zeros_like(seed)
+
+    keep_components = min(max_components, 2) if shape_mode in {"light", "strict"} else max_components
+    candidates = sorted(candidates, key=lambda item: item[0], reverse=True)[:keep_components]
+    cleaned = np.zeros_like(seed)
+    for _, local in candidates:
+        cleaned[local > 0] = 1
+    cleaned = _fill_external_contours(cleaned)
+
+    smooth_k = _odd_kernel_size(max(3, open_px * 2 + 1))
+    inside = cv2.distanceTransform(cleaned.astype(np.uint8), cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform((1 - cleaned).astype(np.uint8), cv2.DIST_L2, 5)
+    signed = inside - outside
+    signed = cv2.GaussianBlur(signed, (smooth_k, smooth_k), 0)
+    smooth_mask = (signed > 0).astype(np.uint8)
+    smooth_mask = _fill_external_contours(smooth_mask)
+
+    contours, _ = cv2.findContours((smooth_mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final = np.zeros_like(cleaned)
+    for cnt in contours:
+        if cv2.contourArea(cnt) < max(300, min_area_px // 4):
+            continue
+        smooth_cnt = _smooth_tight_contour(cnt, smooth_eps=smooth_eps, smooth_iter=smooth_iter)
+        cv2.drawContours(final, [smooth_cnt], -1, 1, thickness=-1)
+    return final.astype(np.uint8)
+
+
 def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
                          H: int, W: int, thr: float = 0.30) -> np.ndarray:
     grid = np.zeros((n_rows, n_cols), dtype=np.uint8)
@@ -379,6 +675,16 @@ def pixel_to_patch_grid(mask: np.ndarray, n_rows: int, n_cols: int,
     return grid
 
 
+def draw_visible_contours(canvas, mask, color, thickness=3):
+    mask_u8 = (mask * 255).astype(np.uint8)
+    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return canvas
+    cv2.drawContours(canvas, cnts, -1, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.drawContours(canvas, cnts, -1, color, thickness, cv2.LINE_AA)
+    return canvas
+
+
 def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
     H, W   = gray.shape
     base   = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -389,15 +695,13 @@ def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
     pred_only = (pred_mask == 1) & (gt_mask == 0)
     both      = (gt_mask == 1) & (pred_mask == 1)
 
-    for region, color in [(gt_only, (255, 50, 50)), (pred_only, (30, 30, 220)), (both, (180, 30, 180))]:
+    for region, color in [(gt_only, (40, 180, 40)), (pred_only, (40, 40, 220)), (both, (0, 220, 220))]:
         layer = np.zeros_like(canvas)
         layer[region] = color
         canvas = cv2.addWeighted(canvas, 1.0, layer, ALPHA, 0)
 
-    for mask_u8, color in [((gt_mask * 255).astype(np.uint8), (255, 80, 80)),
-                            ((pred_mask * 255).astype(np.uint8), (60, 60, 255))]:
-        cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(canvas, cnts, -1, color, 2)
+    draw_visible_contours(canvas, gt_mask,   (40, 255, 40), thickness=3)
+    draw_visible_contours(canvas, pred_mask, (40, 40, 255), thickness=3)
 
     LEG_W  = 210
     legend = np.full((H, LEG_W, 3), 25, dtype=np.uint8)
@@ -419,18 +723,57 @@ def make_overlay_image(gray, gt_mask, pred_mask, iou, stem):
     txt(legend, f"Dice : {dice*100:.1f}%", 54, (180, 255, 180), 0.42)
     txt(legend, f"Sens : {sens_m*100:.1f}%", 72, (180, 255, 180), 0.42)
     txt(legend, f"Prec : {prec_m*100:.1f}%", 90, (180, 255, 180), 0.42)
-    box(legend, (255, 80, 80),  118); txt(legend, f"Bac si : {gt_px:,}px",  120, (200, 180, 255))
-    box(legend, (60, 60, 255),  138); txt(legend, f"Model  : {pr_px:,}px",  140, (180, 200, 255))
-    box(legend, (180, 30, 180), 158); txt(legend, f"Trung  : {bo_px:,}px",  160, (255, 180, 255))
+    box(legend, (40, 255, 40),  118); txt(legend, f"Bac si : {gt_px:,}px",  120, (180, 255, 180))
+    box(legend, (40, 40, 255),  138); txt(legend, f"Model  : {pr_px:,}px",  140, (180, 180, 255))
+    box(legend, (0, 220, 220), 158); txt(legend, f"Trung  : {bo_px:,}px",  160, (180, 255, 255))
     txt(legend, f"Union  : {un_px:,}px", 178, (160, 160, 160))
 
     if H > 220:
-        txt(legend, "DO/XANH = Bac si",   H - 56, (255, 120, 120), 0.38)
-        txt(legend, "XANH DUONG = Model", H - 40, (120, 120, 255), 0.38)
-        txt(legend, "TIM  = Trung nhau",  H - 24, (255, 120, 255), 0.38)
+        txt(legend, "XANH LA = Bac si", H - 56, (120, 255, 120), 0.38)
+        txt(legend, "DO = Model",       H - 40, (120, 120, 255), 0.38)
+        txt(legend, "VANG = Trung nhau", H - 24, (120, 255, 255), 0.38)
 
     sep = np.full((H, 4, 3), 60, dtype=np.uint8)
     return np.hstack([base, sep, canvas, sep, legend])
+
+
+def make_contour_image(gray, gt_mask, pred_mask, iou, stem):
+    H, W = gray.shape
+    canvas = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    draw_visible_contours(canvas, gt_mask,   (40, 255, 40), thickness=3)
+    draw_visible_contours(canvas, pred_mask, (40, 40, 255), thickness=3)
+
+    legend = np.full((H, 230, 3), 25, dtype=np.uint8)
+    cv2.putText(legend, stem[:24], (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(legend, f"Image IoU: {iou*100:.1f}%", (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 255, 180), 1, cv2.LINE_AA)
+    cv2.line(legend, (10, 68), (45, 68), (40, 255, 40), 3)
+    cv2.putText(legend, "Bac si contour", (55, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 230, 190), 1, cv2.LINE_AA)
+    cv2.line(legend, (10, 92), (45, 92), (40, 40, 255), 3)
+    cv2.putText(legend, "Model contour", (55, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 190, 255), 1, cv2.LINE_AA)
+    sep = np.full((H, 4, 3), 60, dtype=np.uint8)
+    return np.hstack([canvas, sep, legend])
+
+
+def save_bgr_image(path, img_bgr):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ok = False
+    try:
+        ok = bool(cv2.imwrite(path, img_bgr))
+    except Exception:
+        ok = False
+    if not ok:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        try:
+            Image.fromarray(img_rgb).save(path)
+            ok = True
+        except PermissionError:
+            print(f"[WARN] Khong ghi duoc anh vi file dang bi khoa: {path}")
+            ok = False
+        except Exception as e:
+            print(f"[WARN] Khong ghi duoc anh {path}: {type(e).__name__}: {e}")
+            ok = False
+    return ok
 
 
 def compute_metrics(y_true, y_pred):
@@ -491,6 +834,15 @@ def run_evaluate(
     pp_close_iter   : int   = None,
     pp_min_area     : int   = None,
     pp_min_height   : int   = None,
+    contour_pp      : bool  = False,
+    contour_min_area_px: int = 700,
+    contour_min_height_px: int = 32,
+    contour_max_components: int = 4,
+    contour_close_px: int = 55,
+    contour_open_px : int = 3,
+    contour_smooth_eps: float = 0.004,
+    contour_smooth_iter: int = 3,
+    contour_shape_mode: str = "balanced",
     save_outputs    : bool  = True,
     apply_postprocess: bool = True,
 ):
@@ -498,8 +850,10 @@ def run_evaluate(
     models_dir  = os.path.join(data_dir, "models")
     out_dir     = os.path.abspath(out_dir) if out_dir else os.path.join(data_dir, "eval_results")
     overlay_dir = os.path.join(out_dir, "overlays")
+    contour_dir = os.path.join(out_dir, "contours")
     if save_outputs:
         os.makedirs(overlay_dir, exist_ok=True)
+        os.makedirs(contour_dir, exist_ok=True)
 
     # ── 1. Load test split ─────────────────────────────────────────
     split_path = os.path.join(models_dir, "test_split_images.json")
@@ -544,14 +898,29 @@ def run_evaluate(
     for fname in wanted_files:
         p = os.path.join(models_dir, fname)
         if os.path.exists(p):
-            raw_model = joblib.load(p)
+            size_mb = os.path.getsize(p) / (1024 * 1024)
+            print(f"[eval] Dang load model: {fname} ({size_mb:.1f} MB). Vui long doi...", flush=True)
+            t0 = time.perf_counter()
+            try:
+                raw_model = joblib.load(p)
+            except KeyboardInterrupt:
+                print("\n[eval] Ban da dung chuong trinh trong luc joblib dang load/giai nen model.")
+                print("       Day khong phai loi predict. Hay chay lai va doi den khi load xong.")
+                print("       Model hien tai kha lon; auto dang uu tien extratrees_model.pkl.")
+                sys.exit(130)
+            except Exception as e:
+                print(f"[WARN] Khong load duoc {fname}: {type(e).__name__}: {e}")
+                if model_key != "auto":
+                    sys.exit(1)
+                continue
+            load_sec = time.perf_counter() - t0
             if fname.startswith("extratrees"):
                 loaded_model_key = "extratrees"
             elif fname.startswith("stacking"):
                 loaded_model_key = "stacking"
             elif fname.startswith("rf"):
                 loaded_model_key = "rf"
-            print(f"[eval] Model: {fname} (--model {model_key})")
+            print(f"[eval] Model: {fname} (--model {model_key}) loaded in {load_sec:.1f}s")
             break
     if raw_model is None:
         print(f"[ERROR] Khong tim thay model {', '.join(wanted_files)} trong {models_dir}"); sys.exit(1)
@@ -610,6 +979,14 @@ def run_evaluate(
     print(f"  SELECTED ({len(SELECTED_FEATURES)}): {SELECTED_FEATURES}")
     print(f"  Threshold dang dung: {thr_final} (Train saved: {val_thr_from_train})")
     print(f"  PP config: mode={pp_mode}, close_iter={pp_close_iter}, min_area={pp_min_area}, min_height={pp_min_height}")
+    print(
+        "  Contour PP: "
+        f"{'ON' if contour_pp else 'OFF'}, "
+        f"area>={contour_min_area_px}, height>={contour_min_height_px}, "
+        f"max_comp={contour_max_components}, close={contour_close_px}, "
+        f"open={contour_open_px}, smooth={contour_smooth_eps}, "
+        f"iter={contour_smooth_iter}, shape={contour_shape_mode}"
+    )
 
     # ── 4. Tìm thư mục ảnh & mask ─────────────────────────────────
     img_dir = next(
@@ -662,6 +1039,18 @@ def run_evaluate(
                 pp_min_height=pp_min_height)
             pred_grid = (res["pred_final"] > 0).astype(np.uint8)
             pred_pixel_full = pred_grid_to_pixel(pred_grid, H, W)
+            if contour_pp:
+                pred_pixel_full = doctor_contour_postprocess(
+                    pred_pixel_full,
+                    min_area_px=contour_min_area_px,
+                    min_height_px=contour_min_height_px,
+                    max_components=contour_max_components,
+                    close_px=contour_close_px,
+                    open_px=contour_open_px,
+                    smooth_eps=contour_smooth_eps,
+                    smooth_iter=contour_smooth_iter,
+                    shape_mode=contour_shape_mode,
+                )
 
             nr, nc = res["n_rows"], res["n_cols"]
             gt_patch = pixel_to_patch_grid(gt_pixel, nr, nc, H, W, mask_patch_thr)
@@ -680,7 +1069,9 @@ def run_evaluate(
 
             if save_outputs:
                 ov_img = make_overlay_image(gray, gt_pixel, pred_pixel_full, ovl["iou"], stem)
-                cv2.imwrite(os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img)
+                save_bgr_image(os.path.join(overlay_dir, f"{stem}_eval.png"), ov_img)
+                contour_img = make_contour_image(gray, gt_pixel, pred_pixel_full, ovl["iou"], stem)
+                save_bgr_image(os.path.join(contour_dir, f"{stem}_contour.png"), contour_img)
 
             per_image.append({
                 "stem": stem, "img_path": img_path, "mask_path": mask_path,
@@ -743,13 +1134,20 @@ def run_evaluate(
         "per_image":     per_image,
     }
     if save_outputs:
-        with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
+        try:
+            with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
+                json.dump(output, f, indent=2, ensure_ascii=False)
+        except PermissionError:
+            print(f"[WARN] Khong ghi duoc eval_results.json vi file dang bi khoa: {out_dir}")
 
     if save_outputs:
         print(f"\n{SEP}")
         print(f"  Báo cáo → {out_dir}")
         print(f"{SEP}")
+    if save_outputs:
+        print(f"  Anh overlay    -> {overlay_dir}")
+        print(f"  Anh duong bao  -> {contour_dir}")
+        print("  Mo file *_contour.png de xem: xanh la = bac si, do = model")
     return output
 
 
@@ -777,6 +1175,21 @@ if __name__ == "__main__":
     parser.add_argument("--pp_close_iter",  default=None, type=int)
     parser.add_argument("--pp_min_area",    default=None, type=int)
     parser.add_argument("--pp_min_height",  default=None, type=int)
+    parser.add_argument("--contour_pp",     dest="contour_pp", action="store_true",
+                        help="Loc pixel roi rac va lam muot thanh contour giong duong ve bac si")
+    parser.add_argument("--no_contour_pp",  dest="contour_pp", action="store_false",
+                        help="Tat contour smoothing/filtering, chi ve mask tho")
+    parser.set_defaults(contour_pp=True)
+    parser.add_argument("--contour_min_area_px", default=700, type=int)
+    parser.add_argument("--contour_min_height_px", default=32, type=int)
+    parser.add_argument("--contour_max_components", default=4, type=int)
+    parser.add_argument("--contour_close_px", default=55, type=int)
+    parser.add_argument("--contour_open_px", default=3, type=int)
+    parser.add_argument("--contour_smooth_eps", default=0.004, type=float)
+    parser.add_argument("--contour_smooth_iter", default=3, type=int)
+    parser.add_argument("--contour_shape_mode", default="balanced",
+                        choices=["balanced", "light", "strict"],
+                        help="balanced=giu IoU tot; light=cat duoi/co bat thuong; strict=gioi han mo ngang theo tung hang")
     parser.add_argument("--n_theta",        default=N_THETA,     type=int)
     parser.add_argument("--n_r",            default=N_R_SAMPLES, type=int)
     parser.add_argument("--te_low_pct",     default=TE_LOW_PCT,  type=int)
@@ -796,6 +1209,7 @@ if __name__ == "__main__":
     print(f"  Model       : {args.model}")
     print(f"  Threshold   : {args.thr_final if args.thr_final is not None else ('[tuned]' if args.tuned else '[model_config]')}")
     print(f"  Post-process: {'BẬT' if apply_pp else 'TẮT'}")
+    print(f"  Contour PP  : {'BAT' if args.contour_pp else 'TAT'}")
     print("  Pipeline    : Noise.py feature extraction, no old geometric/ray pipeline")
     print("=" * 80 + "\n")
 
@@ -815,6 +1229,15 @@ if __name__ == "__main__":
         pp_close_iter    = args.pp_close_iter,
         pp_min_area      = args.pp_min_area,
         pp_min_height    = args.pp_min_height,
+        contour_pp       = args.contour_pp,
+        contour_min_area_px = args.contour_min_area_px,
+        contour_min_height_px = args.contour_min_height_px,
+        contour_max_components = args.contour_max_components,
+        contour_close_px = args.contour_close_px,
+        contour_open_px  = args.contour_open_px,
+        contour_smooth_eps = args.contour_smooth_eps,
+        contour_smooth_iter = args.contour_smooth_iter,
+        contour_shape_mode = args.contour_shape_mode,
         save_outputs     = not args.no_save,
         apply_postprocess= apply_pp,
     )

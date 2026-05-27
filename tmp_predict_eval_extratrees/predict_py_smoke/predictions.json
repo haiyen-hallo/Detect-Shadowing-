@@ -1,0 +1,31 @@
+{
+  "summary": {
+    "n_images": 1,
+    "n_ok": 1,
+    "n_fail": 0,
+    "total_pred_patches": 226,
+    "total_pred_pixels": 63186,
+    "model": "extratrees_model.pkl",
+    "threshold": 0.45,
+    "grid_postprocess": false,
+    "contour_postprocess": true
+  },
+  "per_image": [
+    {
+      "stem": "240017185_009",
+      "img_path": "C:\\Users\\ThinkPad\\Graduation_project\\Data\\bongcan_test\\240017185_009.jpg",
+      "height": 770,
+      "width": 1136,
+      "grid": [
+        48,
+        71
+      ],
+      "n_pred_patches": 226,
+      "pred_pixels": 63186,
+      "mask_path": "C:\\Users\\ThinkPad\\Graduation_project\\tmp_predict_eval_extratrees\\predict_py_smoke\\masks\\240017185_009_mask.png",
+      "patch_mask_path": "C:\\Users\\ThinkPad\\Graduation_project\\tmp_predict_eval_extratrees\\predict_py_smoke\\patch_masks\\240017185_009_patch_mask.png",
+      "overlay_path": "C:\\Users\\ThinkPad\\Graduation_project\\tmp_predict_eval_extratrees\\predict_py_smoke\\overlays\\240017185_009_predict.png",
+      "contour_path": "C:\\Users\\ThinkPad\\Graduation_project\\tmp_predict_eval_extratrees\\predict_py_smoke\\contours\\240017185_009_contour.png"
+    }
+  ]
+}
